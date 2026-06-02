@@ -17,7 +17,7 @@ Automatic crash breadcrumbs, screen timing, URLSession timing, retry, and offlin
 
 ## Install
 
-The package is not published yet. Once the repository is public and tagged, add it with Swift Package Manager:
+Add the public Swift package with Swift Package Manager:
 
 ```swift
 dependencies: [
@@ -30,6 +30,10 @@ Then depend on the library product:
 ```swift
 .product(name: "Logister", package: "logister-ios")
 ```
+
+- Swift Package Manager URL: https://github.com/taimoorq/logister-ios.git
+- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.1.0
+- iOS integration docs: https://docs.logister.org/integrations/ios/
 
 ## Swift Package Release
 
