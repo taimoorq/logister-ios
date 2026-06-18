@@ -29,6 +29,9 @@ struct LogisterClientTests {
             baseURL: URL(string: "https://logister.example")!,
             environment: "production",
             release: "1.0.0+42",
+            repository: "acme/ios",
+            commitSHA: "abc1234",
+            branch: "main",
             service: "com.example.app",
             transport: transport
         )
@@ -53,6 +56,9 @@ struct LogisterClientTests {
         #expect(event["release"] as? String == "1.0.0+42")
         #expect(context["platform"] as? String == "ios")
         #expect(context["service"] as? String == "com.example.app")
+        #expect(context["repository"] as? String == "acme/ios")
+        #expect(context["commit_sha"] as? String == "abc1234")
+        #expect(context["branch"] as? String == "main")
         #expect(context["session_id"] as? String == "session-123")
         #expect(context["screen_name"] as? String == "Checkout")
         #expect(context["value"] as? Double == 0.98)

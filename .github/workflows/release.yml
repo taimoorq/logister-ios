@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version to release, for example 0.1.0.
+        description: Version to release, for example 0.1.1.
         required: true
 
 permissions:
@@ -33,12 +33,27 @@ jobs:
           fi
 
           if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'; then
-            echo "::error::Version must be semantic, for example 0.1.0."
+            echo "::error::Version must be semantic, for example 0.1.1."
             exit 1
           fi
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify checked-in version
+        run: |
+          expected="$(tr -d '[:space:]' < VERSION)"
+          actual="${{ steps.release_version.outputs.version }}"
+
+          if [ -z "$expected" ]; then
+            echo "::error::Missing VERSION file content."
+            exit 1
+          fi
+
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Release version $actual does not match VERSION $expected."
+            exit 1
+          fi
 
       - name: Secret scan
         run: bash scripts/secret-scan.sh

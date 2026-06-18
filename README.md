@@ -21,7 +21,7 @@ Add the public Swift package with Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.1.0")
+    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.1.1")
 ]
 ```
 
@@ -32,17 +32,19 @@ Then depend on the library product:
 ```
 
 - Swift Package Manager URL: https://github.com/taimoorq/logister-ios.git
-- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.1.0
+- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.1.1
 - iOS integration docs: https://docs.logister.org/integrations/ios/
 
 ## Swift Package Release
 
 Swift Package Manager distribution does not require a package registry account.
-Publishing a new package version means pushing a semantic version tag:
+After CI passes on `main`, the release-from-main workflow creates the matching
+version tag from `VERSION` and dispatches the release workflow. You can also
+push a semantic version tag manually:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 The release workflow runs the secret scan and test suite, then creates or
@@ -60,6 +62,9 @@ let client = LogisterClient(
     baseURL: URL(string: "https://your-logister-host.example")!,
     environment: "production",
     release: "1.4.0+42",
+    repository: "acme/ios-app",
+    commitSHA: "4f8c2d1",
+    branch: "main",
     service: Bundle.main.bundleIdentifier,
     defaultContext: [
         "app_version": .string("1.4.0"),
@@ -84,6 +89,11 @@ try await client.captureTransaction(
     options: LogisterEventOptions(context: ["screen_name": .string("Checkout")])
 )
 ```
+
+When the Logister project is connected to a GitHub repository, `repository`,
+`commitSHA`, and `branch` help source-aware error details resolve frames to the
+right code. CI/CD systems should record release-to-commit deployment mappings
+with the Logister HTTP API `POST /api/v1/deployments` endpoint.
 
 ## Spans And Check-ins
 

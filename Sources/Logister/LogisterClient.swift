@@ -46,6 +46,9 @@ public struct LogisterClient {
     public var apiKey: String
     public var environment: String?
     public var release: String?
+    public var repository: String?
+    public var commitSHA: String?
+    public var branch: String?
     public var service: String?
     public var defaultContext: LogisterContext
 
@@ -56,6 +59,9 @@ public struct LogisterClient {
         baseURL: URL,
         environment: String? = nil,
         release: String? = nil,
+        repository: String? = nil,
+        commitSHA: String? = nil,
+        branch: String? = nil,
         service: String? = nil,
         defaultContext: LogisterContext = [:],
         transport: LogisterTransport = URLSessionLogisterTransport()
@@ -65,6 +71,9 @@ public struct LogisterClient {
             endpoint: baseURL.appendingPathComponent("api/v1/ingest_events"),
             environment: environment,
             release: release,
+            repository: repository,
+            commitSHA: commitSHA,
+            branch: branch,
             service: service,
             defaultContext: defaultContext,
             transport: transport
@@ -76,6 +85,9 @@ public struct LogisterClient {
         endpoint: URL,
         environment: String? = nil,
         release: String? = nil,
+        repository: String? = nil,
+        commitSHA: String? = nil,
+        branch: String? = nil,
         service: String? = nil,
         defaultContext: LogisterContext = [:],
         transport: LogisterTransport = URLSessionLogisterTransport()
@@ -84,6 +96,9 @@ public struct LogisterClient {
         self.endpoint = endpoint
         self.environment = environment
         self.release = release
+        self.repository = repository
+        self.commitSHA = commitSHA
+        self.branch = branch
         self.service = service
         self.defaultContext = defaultContext
         self.transport = transport
@@ -102,7 +117,7 @@ public struct LogisterClient {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("logister-ios/0.1.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("logister-ios/0.1.1", forHTTPHeaderField: "User-Agent")
 
         return try await transport.send(request: request, body: body)
     }
@@ -226,6 +241,15 @@ public struct LogisterClient {
         ]
         if let service {
             context["service"] = .string(service)
+        }
+        if let repository {
+            context["repository"] = .string(repository)
+        }
+        if let commitSHA {
+            context["commit_sha"] = .string(commitSHA)
+        }
+        if let branch {
+            context["branch"] = .string(branch)
         }
         context.merge(defaultContext) { _, new in new }
         return context
