@@ -22,7 +22,7 @@ Add the public Swift package with Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.1.2")
+    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.1.3")
 ]
 ```
 
@@ -33,7 +33,7 @@ Then depend on the library product:
 ```
 
 - Swift Package Manager URL: https://github.com/taimoorq/logister-ios.git
-- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.1.2
+- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.1.3
 - iOS integration docs: https://docs.logister.org/integrations/ios/
 
 ## Swift Package Release
@@ -44,8 +44,8 @@ version tag from `VERSION` and dispatches the release workflow. You can also
 push a semantic version tag manually:
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 The release workflow runs the secret scan and test suite, then creates or

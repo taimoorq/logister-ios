@@ -173,7 +173,7 @@ public struct LogisterClient {
         request.setValue("Bearer \(mobileIngestToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("logister-ios/0.1.2", forHTTPHeaderField: "User-Agent")
+        request.setValue("logister-ios/0.1.3", forHTTPHeaderField: "User-Agent")
 
         return try await transport.send(request: request, body: body)
     }

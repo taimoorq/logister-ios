@@ -50,7 +50,9 @@ final class LogisterClientTests: XCTestCase {
 
         XCTAssertTrue(response.accepted)
         XCTAssertEqual(transport.request?.value(forHTTPHeaderField: "Authorization"), "Bearer mobile-token-1")
-        XCTAssertEqual(tokenProvider.fetchCount, 1)
+        XCTAssertEqual(transport.request?.value(forHTTPHeaderField: "User-Agent"), "logister-ios/0.1.3")
+        let fetchCount = await tokenProvider.fetchCount
+        XCTAssertEqual(fetchCount, 1)
 
         let envelope = try transport.envelope()
         let event = try XCTUnwrap(envelope["event"] as? [String: Any])
@@ -150,7 +152,8 @@ final class LogisterClientTests: XCTestCase {
         try await client.captureMessage("one")
         try await client.captureMessage("two")
 
-        XCTAssertEqual(tokenProvider.fetchCount, 1)
+        let fetchCount = await tokenProvider.fetchCount
+        XCTAssertEqual(fetchCount, 1)
         XCTAssertEqual(
             transport.requests.map { $0.value(forHTTPHeaderField: "Authorization") },
             [ "Bearer mobile-token-1", "Bearer mobile-token-1" ]
@@ -172,7 +175,8 @@ final class LogisterClientTests: XCTestCase {
         try await client.captureMessage("one")
         try await client.captureMessage("two")
 
-        XCTAssertEqual(tokenProvider.fetchCount, 2)
+        let fetchCount = await tokenProvider.fetchCount
+        XCTAssertEqual(fetchCount, 2)
         XCTAssertEqual(
             transport.requests.map { $0.value(forHTTPHeaderField: "Authorization") },
             [ "Bearer mobile-token-1", "Bearer mobile-token-2" ]
@@ -238,8 +242,7 @@ final class LogisterClientTests: XCTestCase {
     }
 }
 
-final class SequenceTokenProvider: LogisterTokenProvider, @unchecked Sendable {
-    private let lock = NSLock()
+actor SequenceTokenProvider: LogisterTokenProvider {
     private var tokens: [LogisterToken]
     private(set) var fetchCount = 0
 
@@ -248,9 +251,6 @@ final class SequenceTokenProvider: LogisterTokenProvider, @unchecked Sendable {
     }
 
     func fetchToken() async throws -> LogisterToken {
-        lock.lock()
-        defer { lock.unlock() }
-
         fetchCount += 1
         if tokens.count > 1 {
             return tokens.removeFirst()
