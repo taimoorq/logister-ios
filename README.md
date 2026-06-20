@@ -9,6 +9,7 @@ This repository is the canonical home for the iOS package add-on. Build Swift Pa
 - Swift Package Manager library product named `Logister`.
 - Async/await client backed by `URLSession`.
 - Injectable transport for tests or alternate networking stacks.
+- Async token-provider based authentication with short-lived mobile ingest tokens.
 - Typed JSON context values for safe event metadata.
 - Client methods for errors, logs, metrics, transactions, spans, and check-ins.
 - Capture iOS app metadata such as bundle ID, app version, build number, iOS version, device model, locale, and session ID.
@@ -21,7 +22,7 @@ Add the public Swift package with Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.1.1")
+    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.1.2")
 ]
 ```
 
@@ -32,7 +33,7 @@ Then depend on the library product:
 ```
 
 - Swift Package Manager URL: https://github.com/taimoorq/logister-ios.git
-- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.1.1
+- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.1.2
 - iOS integration docs: https://docs.logister.org/integrations/ios/
 
 ## Swift Package Release
@@ -43,8 +44,8 @@ version tag from `VERSION` and dispatches the release workflow. You can also
 push a semantic version tag manually:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 The release workflow runs the secret scan and test suite, then creates or
@@ -53,13 +54,30 @@ the Git tag itself.
 
 ## Basic Usage
 
+Do not compile a Logister project API key into an iOS app. The iOS SDK requires
+an async `LogisterTokenProvider`; implement it by calling your own backend. Your
+backend should authenticate the app/session, use its server-side Logister
+project API key to mint a short-lived token with
+`POST /api/v1/mobile_ingest_tokens`, and return that token to the app.
+
 ```swift
 import Foundation
 import Logister
 
+struct AppBackendTokenProvider: LogisterTokenProvider {
+    func fetchToken() async throws -> LogisterToken {
+        // Call your app backend, not Logister directly. Return the token and
+        // expires_at value from your backend's mobile token response.
+        LogisterToken(
+            token: "short-lived-mobile-token",
+            expiresAt: Date().addingTimeInterval(900)
+        )
+    }
+}
+
 let client = LogisterClient(
-    apiKey: "your-project-api-token",
     baseURL: URL(string: "https://your-logister-host.example")!,
+    tokenProvider: AppBackendTokenProvider(),
     environment: "production",
     release: "1.4.0+42",
     repository: "acme/ios-app",
@@ -132,12 +150,12 @@ swift test
 ## Public Repository Hygiene
 
 This repository is designed to be public and open source. Keep examples generic:
-use placeholder API tokens, example hostnames, and environment variables instead
-of real project credentials.
+use placeholder short-lived mobile tokens, example hostnames, and environment
+variables instead of real project credentials.
 
 Do not commit Apple signing certificates, provisioning profiles, App Store
-Connect keys, Logister project API keys, Cloudflare tokens, `.env` files, or
-machine-specific configuration.
+Connect keys, Logister project API keys, mobile token issuer secrets, Cloudflare
+tokens, `.env` files, or machine-specific configuration.
 
 CI runs `scripts/secret-scan.sh`, and dependency updates are tracked by
 `.github/dependabot.yml` for Swift Package Manager and GitHub Actions.

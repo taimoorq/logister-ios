@@ -20,6 +20,7 @@ public struct LogisterResponse: Equatable, Sendable {
 public enum LogisterError: Error, Equatable {
     case invalidPayload
     case invalidResponse
+    case invalidMobileIngestToken
 }
 
 public protocol LogisterTransport {
@@ -41,9 +42,59 @@ public struct URLSessionLogisterTransport: LogisterTransport {
     }
 }
 
+public struct LogisterToken: Equatable, Sendable {
+    public var token: String
+    public var expiresAt: Date
+
+    public init(token: String, expiresAt: Date) {
+        self.token = token
+        self.expiresAt = expiresAt
+    }
+
+    fileprivate func isExpired(now: Date) -> Bool {
+        expiresAt <= now
+    }
+
+    fileprivate func shouldRefresh(now: Date, refreshSkew: TimeInterval) -> Bool {
+        expiresAt <= now.addingTimeInterval(refreshSkew)
+    }
+}
+
+public protocol LogisterTokenProvider: Sendable {
+    func fetchToken() async throws -> LogisterToken
+}
+
+private actor LogisterTokenStore {
+    private let provider: any LogisterTokenProvider
+    private let refreshSkew: TimeInterval
+    private var cachedToken: LogisterToken?
+
+    init(provider: any LogisterTokenProvider, refreshSkew: TimeInterval) {
+        self.provider = provider
+        self.refreshSkew = refreshSkew
+    }
+
+    func mobileIngestToken() async throws -> String {
+        let now = Date()
+        if let cachedToken, !cachedToken.shouldRefresh(now: now, refreshSkew: refreshSkew) {
+            return cachedToken.token
+        }
+
+        let fresh = try await provider.fetchToken()
+        guard !fresh.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw LogisterError.invalidMobileIngestToken
+        }
+        guard !fresh.isExpired(now: Date()) else {
+            throw LogisterError.invalidMobileIngestToken
+        }
+
+        cachedToken = fresh
+        return fresh.token
+    }
+}
+
 public struct LogisterClient {
     public var endpoint: URL
-    public var apiKey: String
     public var environment: String?
     public var release: String?
     public var repository: String?
@@ -53,10 +104,11 @@ public struct LogisterClient {
     public var defaultContext: LogisterContext
 
     private let transport: LogisterTransport
+    private let tokenStore: LogisterTokenStore
 
     public init(
-        apiKey: String,
         baseURL: URL,
+        tokenProvider: any LogisterTokenProvider,
         environment: String? = nil,
         release: String? = nil,
         repository: String? = nil,
@@ -64,11 +116,12 @@ public struct LogisterClient {
         branch: String? = nil,
         service: String? = nil,
         defaultContext: LogisterContext = [:],
+        tokenRefreshSkew: TimeInterval = 60,
         transport: LogisterTransport = URLSessionLogisterTransport()
     ) {
         self.init(
-            apiKey: apiKey,
             endpoint: baseURL.appendingPathComponent("api/v1/ingest_events"),
+            tokenProvider: tokenProvider,
             environment: environment,
             release: release,
             repository: repository,
@@ -76,13 +129,14 @@ public struct LogisterClient {
             branch: branch,
             service: service,
             defaultContext: defaultContext,
+            tokenRefreshSkew: tokenRefreshSkew,
             transport: transport
         )
     }
 
     public init(
-        apiKey: String,
         endpoint: URL,
+        tokenProvider: any LogisterTokenProvider,
         environment: String? = nil,
         release: String? = nil,
         repository: String? = nil,
@@ -90,9 +144,9 @@ public struct LogisterClient {
         branch: String? = nil,
         service: String? = nil,
         defaultContext: LogisterContext = [:],
+        tokenRefreshSkew: TimeInterval = 60,
         transport: LogisterTransport = URLSessionLogisterTransport()
     ) {
-        self.apiKey = apiKey
         self.endpoint = endpoint
         self.environment = environment
         self.release = release
@@ -102,6 +156,7 @@ public struct LogisterClient {
         self.service = service
         self.defaultContext = defaultContext
         self.transport = transport
+        self.tokenStore = LogisterTokenStore(provider: tokenProvider, refreshSkew: tokenRefreshSkew)
     }
 
     @discardableResult
@@ -112,12 +167,13 @@ public struct LogisterClient {
         }
 
         let body = try JSONSerialization.data(withJSONObject: envelope, options: [])
+        let mobileIngestToken = try await tokenStore.mobileIngestToken()
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(mobileIngestToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("logister-ios/0.1.1", forHTTPHeaderField: "User-Agent")
+        request.setValue("logister-ios/0.1.2", forHTTPHeaderField: "User-Agent")
 
         return try await transport.send(request: request, body: body)
     }
