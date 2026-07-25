@@ -10,7 +10,6 @@ on:
       - completed
 
 permissions:
-  actions: write
   contents: write
 
 jobs:
@@ -20,7 +19,7 @@ jobs:
 
     steps:
       - name: Check out released commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
@@ -52,13 +51,10 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create tag and dispatch release
+      - name: Create release tag
         if: steps.tag.outputs.exists != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${{ steps.version.outputs.tag }}" -m "Release logister-ios ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
-          gh workflow run release.yml --ref "${{ steps.version.outputs.tag }}" -f version="${{ steps.version.outputs.version }}"
