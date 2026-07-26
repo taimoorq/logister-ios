@@ -6,14 +6,43 @@ import FoundationNetworking
 public struct LogisterResponse: Equatable, Sendable {
     public var statusCode: Int
     public var body: Data
+    public var headers: [String: String]
 
-    public init(statusCode: Int, body: Data = Data()) {
+    public init(statusCode: Int, body: Data = Data(), headers: [String: String] = [:]) {
         self.statusCode = statusCode
         self.body = body
+        self.headers = headers
     }
 
     public var accepted: Bool {
         (200..<300).contains(statusCode)
+    }
+}
+
+public struct LogisterRetryPolicy: Equatable, Sendable {
+    public var maximumAttempts: Int
+    public var baseDelay: TimeInterval
+    public var maximumDelay: TimeInterval
+
+    public init(maximumAttempts: Int = 3, baseDelay: TimeInterval = 0.25, maximumDelay: TimeInterval = 30) {
+        self.maximumAttempts = max(1, maximumAttempts)
+        self.baseDelay = max(0, baseDelay)
+        self.maximumDelay = max(0, maximumDelay)
+    }
+
+    public static let `default` = LogisterRetryPolicy()
+    public static let disabled = LogisterRetryPolicy(maximumAttempts: 1, baseDelay: 0, maximumDelay: 0)
+
+    func shouldRetry(statusCode: Int) -> Bool {
+        statusCode == 408 || statusCode == 425 || statusCode == 429 || (500...599).contains(statusCode)
+    }
+
+    func delay(after attempt: Int, response: LogisterResponse? = nil) -> TimeInterval {
+        if let retryAfter = response?.headers.first(where: { $0.key.caseInsensitiveCompare("Retry-After") == .orderedSame })?.value,
+           let seconds = TimeInterval(retryAfter), seconds >= 0 {
+            return min(seconds, maximumDelay)
+        }
+        return min(baseDelay * pow(2, Double(max(0, attempt - 1))), maximumDelay)
     }
 }
 
@@ -23,7 +52,7 @@ public enum LogisterError: Error, Equatable {
     case invalidMobileIngestToken
 }
 
-public protocol LogisterTransport {
+public protocol LogisterTransport: Sendable {
     func send(request: URLRequest, body: Data) async throws -> LogisterResponse
 }
 
@@ -38,7 +67,10 @@ public struct URLSessionLogisterTransport: LogisterTransport {
         guard let httpResponse = response as? HTTPURLResponse else {
             throw LogisterError.invalidResponse
         }
-        return LogisterResponse(statusCode: httpResponse.statusCode, body: data)
+        let headers = httpResponse.allHeaderFields.reduce(into: [String: String]()) { result, entry in
+            result[String(describing: entry.key)] = String(describing: entry.value)
+        }
+        return LogisterResponse(statusCode: httpResponse.statusCode, body: data, headers: headers)
     }
 }
 
@@ -93,7 +125,7 @@ private actor LogisterTokenStore {
     }
 }
 
-public struct LogisterClient {
+public struct LogisterClient: Sendable {
     public var endpoint: URL
     public var environment: String?
     public var release: String?
@@ -105,6 +137,7 @@ public struct LogisterClient {
 
     private let transport: LogisterTransport
     private let tokenStore: LogisterTokenStore
+    private let retryPolicy: LogisterRetryPolicy
 
     public init(
         baseURL: URL,
@@ -117,6 +150,7 @@ public struct LogisterClient {
         service: String? = nil,
         defaultContext: LogisterContext = [:],
         tokenRefreshSkew: TimeInterval = 60,
+        retryPolicy: LogisterRetryPolicy = .default,
         transport: LogisterTransport = URLSessionLogisterTransport()
     ) {
         self.init(
@@ -130,6 +164,7 @@ public struct LogisterClient {
             service: service,
             defaultContext: defaultContext,
             tokenRefreshSkew: tokenRefreshSkew,
+            retryPolicy: retryPolicy,
             transport: transport
         )
     }
@@ -145,6 +180,7 @@ public struct LogisterClient {
         service: String? = nil,
         defaultContext: LogisterContext = [:],
         tokenRefreshSkew: TimeInterval = 60,
+        retryPolicy: LogisterRetryPolicy = .default,
         transport: LogisterTransport = URLSessionLogisterTransport()
     ) {
         self.endpoint = endpoint
@@ -156,6 +192,7 @@ public struct LogisterClient {
         self.service = service
         self.defaultContext = defaultContext
         self.transport = transport
+        self.retryPolicy = retryPolicy
         self.tokenStore = LogisterTokenStore(provider: tokenProvider, refreshSkew: tokenRefreshSkew)
     }
 
@@ -173,18 +210,45 @@ public struct LogisterClient {
         request.setValue("Bearer \(mobileIngestToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("logister-ios/0.1.3", forHTTPHeaderField: "User-Agent")
+        request.setValue("\(LogisterSDK.name)/\(LogisterSDK.version)", forHTTPHeaderField: "User-Agent")
 
-        return try await transport.send(request: request, body: body)
+        return try await sendWithRetry(request: request, body: body)
     }
 
     @discardableResult
     public func captureException(_ error: Error, options: LogisterEventOptions = LogisterEventOptions()) async throws -> LogisterResponse {
         var context = options.context
+        let stacktrace = LogisterStackFrameParser.frames(
+            from: Thread.callStackSymbols,
+            applicationImage: Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String
+        )
+        let bridgedError = error as NSError
         context["exception"] = .object([
             "type": .string(String(reflecting: Swift.type(of: error))),
             "message": .string(String(describing: error)),
-            "stacktrace": .array(Thread.callStackSymbols.map { .string($0) })
+            "domain": .string(bridgedError.domain),
+            "code": .number(Double(bridgedError.code)),
+            "stacktrace": .array(stacktrace),
+            "threads": .array([
+                .object([
+                    "id": .string("reporting-thread"),
+                    "name": .string("Reporting thread"),
+                    "triggered": .bool(true),
+                    "frames": .array(stacktrace)
+                ])
+            ])
+        ])
+        context["diagnostic"] = .object([
+            "source": .string("sdk"),
+            "kind": .string("reported_error")
+        ])
+        context["error"] = .object([
+            "mechanism": .string("handled_exception"),
+            "handled": .bool(true),
+            "fatal": .bool(false)
+        ])
+        context["symbolication"] = .object([
+            "status": .string("not_required")
         ])
 
         var eventOptions = options
@@ -258,12 +322,13 @@ public struct LogisterClient {
             "event_type": event.eventType
         ]
 
+        put(event.eventID?.uuidString.lowercased(), into: &payload, key: "uuid")
         put(event.message, into: &payload, key: "message")
         put(options.level ?? event.level, into: &payload, key: "level")
         put(options.fingerprint ?? event.fingerprint, into: &payload, key: "fingerprint")
         put(options.occurredAt.map(LogisterDates.string) ?? event.occurredAt.map(LogisterDates.string), into: &payload, key: "occurred_at")
         put(options.environment ?? environment, into: &payload, key: "environment")
-        put(options.release ?? release, into: &payload, key: "release")
+        put(options.release ?? release ?? LogisterPlatformContext.inferredRelease, into: &payload, key: "release")
         put(options.traceID, into: &payload, key: "trace_id")
         put(options.requestID, into: &payload, key: "request_id")
         put(options.sessionID, into: &payload, key: "session_id")
@@ -276,25 +341,65 @@ public struct LogisterClient {
         }
 
         var context = baseContext()
-        context.merge(event.context) { _, new in new }
-        context.merge(options.context) { _, new in new }
+        context = merge(context, with: event.context)
+        context = merge(context, with: options.context)
         putIfMissing(options.environment ?? environment, into: &context, key: "environment")
-        putIfMissing(options.release ?? release, into: &context, key: "release")
+        putIfMissing(options.release ?? release ?? LogisterPlatformContext.inferredRelease, into: &context, key: "release")
         putIfMissing(options.traceID, into: &context, key: "trace_id")
         putIfMissing(options.requestID, into: &context, key: "request_id")
         putIfMissing(options.sessionID, into: &context, key: "session_id")
         putIfMissing(options.userID, into: &context, key: "user_id")
         putIfMissing(options.transactionName, into: &context, key: "transaction_name")
         putIfMissing(options.durationMs, into: &context, key: "duration_ms")
+        if let sessionID = options.sessionID {
+            mergeObject(["id": .string(sessionID)], into: &context, key: "session")
+        }
+        if let installationIDHash = options.installationIDHash {
+            mergeObject(["id_hash": .string(installationIDHash)], into: &context, key: "installation")
+        }
+        if let distributionChannel = options.distributionChannel {
+            mergeObject(["channel": .string(distributionChannel)], into: &context, key: "distribution")
+        }
+        if let inForeground = options.inForeground {
+            mergeObject(["in_foreground": .bool(inForeground)], into: &context, key: "app")
+        }
+        if !options.breadcrumbs.isEmpty {
+            context["breadcrumbs"] = .array(options.breadcrumbs.map(\.value))
+        }
+        context["platform"] = .string("ios")
+        context = LogisterPrivacySanitizer.sanitize(context)
         payload["context"] = context.mapValues { $0.jsonObject }
 
         return payload
     }
 
+    private func sendWithRetry(request: URLRequest, body: Data) async throws -> LogisterResponse {
+        var attempt = 1
+        while true {
+            do {
+                let response = try await transport.send(request: request, body: body)
+                guard attempt < retryPolicy.maximumAttempts, retryPolicy.shouldRetry(statusCode: response.statusCode) else {
+                    return response
+                }
+                try await waitBeforeRetry(attempt: attempt, response: response)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                guard attempt < retryPolicy.maximumAttempts else { throw error }
+                try await waitBeforeRetry(attempt: attempt)
+            }
+            attempt += 1
+        }
+    }
+
+    private func waitBeforeRetry(attempt: Int, response: LogisterResponse? = nil) async throws {
+        let delay = retryPolicy.delay(after: attempt, response: response)
+        guard delay > 0 else { return }
+        try await Task.sleep(for: .seconds(delay))
+    }
+
     private func baseContext() -> LogisterContext {
-        var context: LogisterContext = [
-            "platform": .string("ios")
-        ]
+        var context = LogisterPlatformContext.context(service: service)
         if let service {
             context["service"] = .string(service)
         }
@@ -307,8 +412,30 @@ public struct LogisterClient {
         if let branch {
             context["branch"] = .string(branch)
         }
-        context.merge(defaultContext) { _, new in new }
+        context = merge(context, with: defaultContext)
         return context
+    }
+
+    private func merge(_ original: LogisterContext, with overrides: LogisterContext) -> LogisterContext {
+        var result = original
+        for (key, value) in overrides {
+            if case .object(let existing) = result[key], case .object(let replacement) = value {
+                result[key] = .object(merge(existing, with: replacement))
+            } else {
+                result[key] = value
+            }
+        }
+        return result
+    }
+
+    private func mergeObject(_ object: LogisterContext, into context: inout LogisterContext, key: String) {
+        let existing: LogisterContext
+        if case .object(let value) = context[key] {
+            existing = value
+        } else {
+            existing = [:]
+        }
+        context[key] = .object(merge(existing, with: object))
     }
 
     private func put<T>(_ value: T?, into payload: inout [String: Any], key: String) {

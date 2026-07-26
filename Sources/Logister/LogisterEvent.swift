@@ -9,9 +9,13 @@ public struct LogisterEventOptions: Equatable, Sendable {
     public var traceID: String?
     public var requestID: String?
     public var sessionID: String?
+    public var installationIDHash: String?
     public var userID: String?
+    public var distributionChannel: String?
+    public var inForeground: Bool?
     public var transactionName: String?
     public var durationMs: Double?
+    public var breadcrumbs: [LogisterBreadcrumb]
     public var context: LogisterContext
 
     public init(
@@ -23,9 +27,13 @@ public struct LogisterEventOptions: Equatable, Sendable {
         traceID: String? = nil,
         requestID: String? = nil,
         sessionID: String? = nil,
+        installationIDHash: String? = nil,
         userID: String? = nil,
+        distributionChannel: String? = nil,
+        inForeground: Bool? = nil,
         transactionName: String? = nil,
         durationMs: Double? = nil,
+        breadcrumbs: [LogisterBreadcrumb] = [],
         context: LogisterContext = [:]
     ) {
         self.level = level
@@ -36,14 +44,53 @@ public struct LogisterEventOptions: Equatable, Sendable {
         self.traceID = traceID
         self.requestID = requestID
         self.sessionID = sessionID
+        self.installationIDHash = installationIDHash
         self.userID = userID
+        self.distributionChannel = distributionChannel
+        self.inForeground = inForeground
         self.transactionName = transactionName
         self.durationMs = durationMs
+        self.breadcrumbs = Array(breadcrumbs.suffix(LogisterBreadcrumb.maximumPerEvent))
         self.context = context
     }
 }
 
+public struct LogisterBreadcrumb: Equatable, Sendable {
+    public static let maximumPerEvent = 100
+
+    public var timestamp: Date
+    public var category: String
+    public var level: String
+    public var message: String
+    public var data: LogisterContext
+
+    public init(
+        timestamp: Date = Date(),
+        category: String = "app",
+        level: String = "info",
+        message: String,
+        data: LogisterContext = [:]
+    ) {
+        self.timestamp = timestamp
+        self.category = category
+        self.level = level
+        self.message = String(message.prefix(1_000))
+        self.data = data
+    }
+
+    var value: LogisterValue {
+        .object([
+            "timestamp": .string(LogisterDates.string(from: timestamp)),
+            "category": .string(category),
+            "level": .string(level),
+            "message": .string(message),
+            "data": .object(data)
+        ])
+    }
+}
+
 public struct LogisterEvent: Equatable, Sendable {
+    public var eventID: UUID?
     public var eventType: String
     public var message: String?
     public var level: String?
@@ -53,6 +100,7 @@ public struct LogisterEvent: Equatable, Sendable {
     public var attributes: LogisterContext
 
     public init(
+        eventID: UUID? = nil,
         eventType: String,
         message: String? = nil,
         level: String? = nil,
@@ -61,6 +109,7 @@ public struct LogisterEvent: Equatable, Sendable {
         context: LogisterContext = [:],
         attributes: LogisterContext = [:]
     ) {
+        self.eventID = eventID
         self.eventType = eventType
         self.message = message
         self.level = level

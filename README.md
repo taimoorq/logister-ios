@@ -21,9 +21,21 @@ Apple app → Logister ingest endpoint with the short-lived token
 - Async token-provider based authentication with short-lived mobile ingest tokens.
 - Typed JSON context values for safe event metadata.
 - Client methods for errors, logs, metrics, transactions, spans, and check-ins.
-- Configurable service, source, release, session, and app/device context on every event.
+- Versioned Apple telemetry with automatic bundle, version/build, Apple platform,
+  OS/build, device family/model, architecture, locale, and SDK context.
+- Explicit handled/fatal semantics, structured threads and frames, bounded
+  breadcrumbs, and opt-in session, rotating installation-hash, distribution,
+  foreground, and source context.
+- An opt-in MetricKit collector for crash, hang, CPU-exception, and disk-write
+  diagnostics. Diagnostic payloads receive stable event IDs so OS redelivery is
+  idempotent at the Logister ingest boundary.
+- Bounded transient retries for timeouts, rate limits, and server errors, with
+  support for `Retry-After`.
 
-Automatic crash breadcrumbs, screen timing, URLSession timing, retries, and offline queues are not included in the current package.
+`captureException` is a handled report; it is not an automatic fatal-crash
+handler. MetricKit is the opt-in source for OS-delivered diagnostics. Automatic
+screen timing, URLSession timing, and a persistent offline queue are not
+included in the current package.
 
 ## Install
 
@@ -31,7 +43,7 @@ Add the public Swift package with Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.1.3")
+    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.2.0")
 ]
 ```
 
@@ -42,7 +54,7 @@ Then depend on the library product:
 ```
 
 - Swift Package Manager URL: https://github.com/taimoorq/logister-ios.git
-- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.1.3
+- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.2.0
 - iOS integration docs: https://logister.org/docs/integrations/ios/
 
 ## Quick start
@@ -120,18 +132,20 @@ let client = LogisterClient(
     commitSHA: "4f8c2d1",
     branch: "main",
     service: Bundle.main.bundleIdentifier,
-    defaultContext: [
-        "app_version": .string("1.4.0"),
-        "build_number": .string("42"),
-        "device_model": .string("iPhone")
-    ]
+    retryPolicy: .default
 )
 
 try await client.captureMessage(
     "Checkout opened",
     options: LogisterEventOptions(
         sessionID: "session-123",
-        context: ["screen_name": .string("Checkout")]
+        installationIDHash: "rotating-random-pseudonym",
+        distributionChannel: "testflight",
+        inForeground: true,
+        breadcrumbs: [
+            LogisterBreadcrumb(category: "navigation", message: "Opened checkout")
+        ],
+        context: ["app": .object(["screen": .string("Checkout")])]
     )
 )
 
@@ -148,6 +162,75 @@ When the Logister project is connected to a GitHub repository, `repository`,
 `commitSHA`, and `branch` help source-aware error details resolve frames to the
 right code. CI/CD systems should record release-to-commit deployment mappings
 with the Logister HTTP API `POST /api/v1/deployments` endpoint.
+
+The package derives the bundle identifier, app version/build, Apple platform,
+OS version/build, device model/family, architecture, locale, SDK version, and a
+default `version+build` release from the running app. Supply overrides only when
+your release model requires them. Never send IDFA, raw IDFV, serial numbers, or
+another stable hardware identifier; the SDK recursively removes common aliases.
+
+## MetricKit diagnostics
+
+Keep one collector alive for the app lifetime and start it after creating the
+client:
+
+```swift
+import Logister
+
+@available(iOS 15.0, *)
+final class AppDiagnostics {
+    let metricKitCollector: LogisterMetricKitCollector
+
+    init(client: LogisterClient) {
+        metricKitCollector = LogisterMetricKitCollector(
+            client: client,
+            onUploadError: { message in
+                // Record locally without including credentials or payload data.
+                print("MetricKit upload failed: \(message)")
+            }
+        )
+        metricKitCollector.start()
+    }
+
+    deinit {
+        metricKitCollector.stop()
+    }
+}
+```
+
+MetricKit delivery is delayed and controlled by the operating system. It is not
+a real-time crash callback. The collector uploads each crash, hang,
+CPU-exception, and disk-write diagnostic through the normal short-lived-token
+path and uses a deterministic event UUID so a repeated payload does not create
+another Logister occurrence.
+
+For address-only production frames, upload the matching zipped dSYM from the
+exported Xcode archive in Project Settings → Integrations. Logister verifies the binary UUID and
+architecture in private archive storage. App Store Connect power/performance
+reports are configured in the same settings area but remain a separate,
+freshness-labelled aggregate; they are not added to SDK or MetricKit counts.
+
+## Delivery behavior
+
+The default retry policy makes at most three attempts for network failures,
+HTTP 408/425/429, and 5xx responses. It honors `Retry-After` up to the configured
+maximum delay. Disable it or tune the bounds explicitly:
+
+```swift
+let client = LogisterClient(
+    baseURL: URL(string: "https://your-logister-host.example")!,
+    tokenProvider: AppBackendTokenProvider(appBackend: appBackend),
+    retryPolicy: LogisterRetryPolicy(
+        maximumAttempts: 2,
+        baseDelay: 0.5,
+        maximumDelay: 10
+    )
+)
+```
+
+A non-2xx response remains non-accepted, and an exhausted transport failure is
+still thrown to the caller. The package does not silently report queued delivery
+as server acceptance.
 
 ## Spans And Check-ins
 

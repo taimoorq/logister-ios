@@ -26,6 +26,29 @@ public enum LogisterValue: Equatable, Sendable {
         self = .bool(value)
     }
 
+    init?(jsonObject: Any) {
+        switch jsonObject {
+        case let value as String:
+            self = .string(value)
+        case let value as Bool:
+            self = .bool(value)
+        case let value as NSNumber:
+            self = .number(value.doubleValue)
+        case let value as [String: Any]:
+            self = .object(value.reduce(into: LogisterContext()) { result, entry in
+                if let converted = LogisterValue(jsonObject: entry.value) {
+                    result[entry.key] = converted
+                }
+            })
+        case let value as [Any]:
+            self = .array(value.compactMap(LogisterValue.init(jsonObject:)))
+        case is NSNull:
+            self = .null
+        default:
+            return nil
+        }
+    }
+
     var jsonObject: Any {
         switch self {
         case .string(let value):

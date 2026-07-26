@@ -59,11 +59,27 @@ jobs:
             exit 1
           fi
 
+          if ! grep -Fq "static let version = \"$expected\"" Sources/Logister/LogisterPlatformContext.swift; then
+            echo "::error::LogisterSDK.version does not match VERSION $expected."
+            exit 1
+          fi
+
       - name: Secret scan
         run: bash scripts/secret-scan.sh
 
       - name: Run tests
         run: swift test
+
+      - name: Prepare release notes
+        env:
+          RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
+        run: |
+          awk -v heading="## v${RELEASE_VERSION} " '
+            index($0, heading) == 1 { in_release = 1; next }
+            in_release && /^## v/ { exit }
+            in_release { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
 
       - name: Create or update GitHub release
         env:
@@ -73,10 +89,10 @@ jobs:
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release edit "$TAG_NAME" \
               --title "$TAG_NAME" \
-              --notes "Swift Package release $TAG_NAME"
+              --notes-file release-notes.md
           else
             gh release create "$TAG_NAME" \
               --verify-tag \
               --title "$TAG_NAME" \
-              --notes "Swift Package release $TAG_NAME"
+              --notes-file release-notes.md
           fi
