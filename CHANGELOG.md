@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.0 - 2026-07-29
+
+- Added explicit full and type-and-stacktrace exception data policies. The safe
+  policy omits error messages, NSError domains/codes, and other raw error text.
+- Made MetricKit collection use the safe policy by default, with bounded
+  threads/frames and without the raw diagnostic payload or termination reason.
+- Added a minimized Apple platform-context policy that omits exact model,
+  locale, architecture, and OS build for apps with stricter privacy contracts.
+- Labeled manual and MetricKit errors with stable capture-source and data-policy
+  metadata so Logister can distinguish redacted reports in the inbox.
+
 ## v0.2.0 - 2026-07-26
 
 - Added the versioned Apple telemetry contract with automatic bundle,

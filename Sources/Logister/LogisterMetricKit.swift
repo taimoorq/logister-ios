@@ -47,7 +47,25 @@ extension LogisterClient {
         _ data: Data,
         kind: LogisterMetricKitDiagnosticKind
     ) async throws -> LogisterResponse {
-        let context = try LogisterMetricKitAdapter.context(from: data, kind: kind)
+        try await captureMetricKitDiagnostic(
+            data,
+            kind: kind,
+            dataPolicy: .typeAndStacktrace
+        )
+    }
+
+    /// Uploads one MetricKit diagnostic using an explicit exception-data policy.
+    @discardableResult
+    public func captureMetricKitDiagnostic(
+        _ data: Data,
+        kind: LogisterMetricKitDiagnosticKind,
+        dataPolicy: LogisterExceptionDataPolicy
+    ) async throws -> LogisterResponse {
+        let context = try LogisterMetricKitAdapter.context(
+            from: data,
+            kind: kind,
+            dataPolicy: dataPolicy
+        )
         return try await capture(
             LogisterEvent(
                 eventID: LogisterMetricKitAdapter.eventID(from: data),
@@ -62,6 +80,8 @@ extension LogisterClient {
 
 enum LogisterMetricKitAdapter {
     static let maximumPayloadBytes = 2_000_000
+    static let maximumThreads = 64
+    static let maximumFramesPerThread = 100
 
     static func eventID(from data: Data) -> UUID {
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
@@ -75,7 +95,11 @@ enum LogisterMetricKitAdapter {
         return UUID(uuidString: value)!
     }
 
-    static func context(from data: Data, kind: LogisterMetricKitDiagnosticKind) throws -> LogisterContext {
+    static func context(
+        from data: Data,
+        kind: LogisterMetricKitDiagnosticKind,
+        dataPolicy: LogisterExceptionDataPolicy = .typeAndStacktrace
+    ) throws -> LogisterContext {
         guard !data.isEmpty, data.count <= maximumPayloadBytes else {
             throw LogisterError.invalidPayload
         }
@@ -113,7 +137,9 @@ enum LogisterMetricKitAdapter {
         put(raw["signal"], into: &exception, key: "signal")
 
         var termination: LogisterContext = ["namespace": .string("MetricKit")]
-        put(raw["terminationReason"] ?? raw["exceptionReason"], into: &termination, key: "reason")
+        if dataPolicy == .full {
+            put(raw["terminationReason"] ?? raw["exceptionReason"], into: &termination, key: "reason")
+        }
         put(raw["exceptionCode"] ?? raw["signal"], into: &termination, key: "code")
 
         var context: LogisterContext = [
@@ -122,7 +148,9 @@ enum LogisterMetricKitAdapter {
                 "mechanism": .string(kind.mechanism),
                 "handled": .bool(false),
                 "fatal": .bool(kind.fatal),
-                "user_perceived": .bool(kind == .crash || kind == .hang || kind == .launchFailure)
+                "user_perceived": .bool(kind == .crash || kind == .hang || kind == .launchFailure),
+                "capture_source": .string("metrickit"),
+                "data_policy": .string(dataPolicy.rawValue)
             ]),
             "exception": .object(exception),
             "termination": .object(termination),
@@ -131,7 +159,7 @@ enum LogisterMetricKitAdapter {
                 "missing_uuids": .array(missingUUIDs.map(LogisterValue.string))
             ])
         ]
-        if let rawValue = LogisterValue(jsonObject: raw) {
+        if dataPolicy == .full, let rawValue = LogisterValue(jsonObject: raw) {
             context["metrickit"] = rawValue
         }
         return LogisterPrivacySanitizer.sanitize(context)
@@ -140,7 +168,7 @@ enum LogisterMetricKitAdapter {
     private static func normalizedThreads(_ raw: [String: Any]) -> [LogisterValue] {
         let tree = (raw["callStackTree"] as? [String: Any]) ?? raw
         let stacks = tree["callStacks"] as? [[String: Any]] ?? []
-        return stacks.enumerated().map { index, stack in
+        return stacks.prefix(maximumThreads).enumerated().map { index, stack in
             let roots = stack["callStackRootFrames"] as? [[String: Any]] ?? []
             return .object([
                 "id": .string(String(index)),
@@ -152,7 +180,13 @@ enum LogisterMetricKitAdapter {
     }
 
     private static func flatten(_ frames: [[String: Any]]) -> [LogisterValue] {
-        frames.flatMap { frame -> [LogisterValue] in
+        var result: [LogisterValue] = []
+        append(frames, to: &result)
+        return result
+    }
+
+    private static func append(_ frames: [[String: Any]], to result: inout [LogisterValue]) {
+        for frame in frames where result.count < maximumFramesPerThread {
             let image = frame["binaryName"] as? String
             var value: LogisterContext = [
                 "application_frame": .bool(image == ProcessInfo.processInfo.processName)
@@ -161,8 +195,9 @@ enum LogisterMetricKitAdapter {
             put(frame["binaryUUID"], into: &value, key: "image_uuid")
             put(frame["address"], into: &value, key: "address")
             put(frame["offsetIntoBinaryTextSegment"], into: &value, key: "relative_address")
+            result.append(.object(value))
             let children = frame["subFrames"] as? [[String: Any]] ?? []
-            return [.object(value)] + flatten(children)
+            append(children, to: &result)
         }
     }
 
@@ -232,11 +267,26 @@ import MetricKit
 @available(iOS 15.0, macOS 13.0, *)
 public final class LogisterMetricKitCollector: NSObject, MXMetricManagerSubscriber, @unchecked Sendable {
     private let client: LogisterClient
+    private let dataPolicy: LogisterExceptionDataPolicy
     private let onUploadError: (@Sendable (String) -> Void)?
     private var started = false
 
-    public init(client: LogisterClient, onUploadError: (@Sendable (String) -> Void)? = nil) {
+    public init(
+        client: LogisterClient,
+        onUploadError: (@Sendable (String) -> Void)? = nil
+    ) {
         self.client = client
+        self.dataPolicy = .typeAndStacktrace
+        self.onUploadError = onUploadError
+    }
+
+    public init(
+        client: LogisterClient,
+        dataPolicy: LogisterExceptionDataPolicy,
+        onUploadError: (@Sendable (String) -> Void)? = nil
+    ) {
+        self.client = client
+        self.dataPolicy = dataPolicy
         self.onUploadError = onUploadError
     }
 
@@ -262,9 +312,9 @@ public final class LogisterMetricKitCollector: NSObject, MXMetricManagerSubscrib
     }
 
     private func upload(_ data: Data, kind: LogisterMetricKitDiagnosticKind) {
-        Task { [client, onUploadError] in
+        Task { [client, dataPolicy, onUploadError] in
             do {
-                try await client.captureMetricKitDiagnostic(data, kind: kind)
+                try await client.captureMetricKitDiagnostic(data, kind: kind, dataPolicy: dataPolicy)
             } catch {
                 onUploadError?(String(describing: error))
             }

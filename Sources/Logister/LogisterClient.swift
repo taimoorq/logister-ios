@@ -138,6 +138,8 @@ public struct LogisterClient: Sendable {
     private let transport: LogisterTransport
     private let tokenStore: LogisterTokenStore
     private let retryPolicy: LogisterRetryPolicy
+    private let exceptionDataPolicy: LogisterExceptionDataPolicy
+    private let platformContextPolicy: LogisterPlatformContextPolicy
 
     public init(
         baseURL: URL,
@@ -154,6 +156,40 @@ public struct LogisterClient: Sendable {
         transport: LogisterTransport = URLSessionLogisterTransport()
     ) {
         self.init(
+            baseURL: baseURL,
+            tokenProvider: tokenProvider,
+            environment: environment,
+            release: release,
+            repository: repository,
+            commitSHA: commitSHA,
+            branch: branch,
+            service: service,
+            defaultContext: defaultContext,
+            tokenRefreshSkew: tokenRefreshSkew,
+            retryPolicy: retryPolicy,
+            exceptionDataPolicy: .full,
+            platformContextPolicy: .standard,
+            transport: transport
+        )
+    }
+
+    public init(
+        baseURL: URL,
+        tokenProvider: any LogisterTokenProvider,
+        environment: String? = nil,
+        release: String? = nil,
+        repository: String? = nil,
+        commitSHA: String? = nil,
+        branch: String? = nil,
+        service: String? = nil,
+        defaultContext: LogisterContext = [:],
+        tokenRefreshSkew: TimeInterval = 60,
+        retryPolicy: LogisterRetryPolicy = .default,
+        exceptionDataPolicy: LogisterExceptionDataPolicy,
+        platformContextPolicy: LogisterPlatformContextPolicy = .standard,
+        transport: LogisterTransport = URLSessionLogisterTransport()
+    ) {
+        self.init(
             endpoint: baseURL.appendingPathComponent("api/v1/ingest_events"),
             tokenProvider: tokenProvider,
             environment: environment,
@@ -165,6 +201,8 @@ public struct LogisterClient: Sendable {
             defaultContext: defaultContext,
             tokenRefreshSkew: tokenRefreshSkew,
             retryPolicy: retryPolicy,
+            exceptionDataPolicy: exceptionDataPolicy,
+            platformContextPolicy: platformContextPolicy,
             transport: transport
         )
     }
@@ -183,6 +221,40 @@ public struct LogisterClient: Sendable {
         retryPolicy: LogisterRetryPolicy = .default,
         transport: LogisterTransport = URLSessionLogisterTransport()
     ) {
+        self.init(
+            endpoint: endpoint,
+            tokenProvider: tokenProvider,
+            environment: environment,
+            release: release,
+            repository: repository,
+            commitSHA: commitSHA,
+            branch: branch,
+            service: service,
+            defaultContext: defaultContext,
+            tokenRefreshSkew: tokenRefreshSkew,
+            retryPolicy: retryPolicy,
+            exceptionDataPolicy: .full,
+            platformContextPolicy: .standard,
+            transport: transport
+        )
+    }
+
+    public init(
+        endpoint: URL,
+        tokenProvider: any LogisterTokenProvider,
+        environment: String? = nil,
+        release: String? = nil,
+        repository: String? = nil,
+        commitSHA: String? = nil,
+        branch: String? = nil,
+        service: String? = nil,
+        defaultContext: LogisterContext = [:],
+        tokenRefreshSkew: TimeInterval = 60,
+        retryPolicy: LogisterRetryPolicy = .default,
+        exceptionDataPolicy: LogisterExceptionDataPolicy,
+        platformContextPolicy: LogisterPlatformContextPolicy = .standard,
+        transport: LogisterTransport = URLSessionLogisterTransport()
+    ) {
         self.endpoint = endpoint
         self.environment = environment
         self.release = release
@@ -193,6 +265,8 @@ public struct LogisterClient: Sendable {
         self.defaultContext = defaultContext
         self.transport = transport
         self.retryPolicy = retryPolicy
+        self.exceptionDataPolicy = exceptionDataPolicy
+        self.platformContextPolicy = platformContextPolicy
         self.tokenStore = LogisterTokenStore(provider: tokenProvider, refreshSkew: tokenRefreshSkew)
     }
 
@@ -222,12 +296,8 @@ public struct LogisterClient: Sendable {
             from: Thread.callStackSymbols,
             applicationImage: Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String
         )
-        let bridgedError = error as NSError
-        context["exception"] = .object([
+        var exception: LogisterContext = [
             "type": .string(String(reflecting: Swift.type(of: error))),
-            "message": .string(String(describing: error)),
-            "domain": .string(bridgedError.domain),
-            "code": .number(Double(bridgedError.code)),
             "stacktrace": .array(stacktrace),
             "threads": .array([
                 .object([
@@ -237,7 +307,14 @@ public struct LogisterClient: Sendable {
                     "frames": .array(stacktrace)
                 ])
             ])
-        ])
+        ]
+        if exceptionDataPolicy == .full {
+            let bridgedError = error as NSError
+            exception["message"] = .string(String(describing: error))
+            exception["domain"] = .string(bridgedError.domain)
+            exception["code"] = .number(Double(bridgedError.code))
+        }
+        context["exception"] = .object(exception)
         context["diagnostic"] = .object([
             "source": .string("sdk"),
             "kind": .string("reported_error")
@@ -245,7 +322,9 @@ public struct LogisterClient: Sendable {
         context["error"] = .object([
             "mechanism": .string("handled_exception"),
             "handled": .bool(true),
-            "fatal": .bool(false)
+            "fatal": .bool(false),
+            "capture_source": .string("manual"),
+            "data_policy": .string(exceptionDataPolicy.rawValue)
         ])
         context["symbolication"] = .object([
             "status": .string("not_required")
@@ -257,7 +336,9 @@ public struct LogisterClient: Sendable {
         return try await capture(
             LogisterEvent(
                 eventType: "error",
-                message: String(describing: error),
+                message: exceptionDataPolicy == .full
+                    ? String(describing: error)
+                    : String(reflecting: Swift.type(of: error)),
                 level: options.level ?? "error"
             ),
             options: eventOptions
@@ -395,11 +476,12 @@ public struct LogisterClient: Sendable {
     private func waitBeforeRetry(attempt: Int, response: LogisterResponse? = nil) async throws {
         let delay = retryPolicy.delay(after: attempt, response: response)
         guard delay > 0 else { return }
-        try await Task.sleep(for: .seconds(delay))
+        let boundedDelay = min(delay, 86_400)
+        try await Task.sleep(nanoseconds: UInt64(boundedDelay * 1_000_000_000))
     }
 
     private func baseContext() -> LogisterContext {
-        var context = LogisterPlatformContext.context(service: service)
+        var context = LogisterPlatformContext.context(service: service, policy: platformContextPolicy)
         if let service {
             context["service"] = .string(service)
         }

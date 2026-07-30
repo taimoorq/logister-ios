@@ -27,15 +27,17 @@ Apple app → Logister ingest endpoint with the short-lived token
   breadcrumbs, and opt-in session, rotating installation-hash, distribution,
   foreground, and source context.
 - An opt-in MetricKit collector for crash, hang, CPU-exception, and disk-write
-  diagnostics. Diagnostic payloads receive stable event IDs so OS redelivery is
-  idempotent at the Logister ingest boundary.
+  diagnostics. Safe collection is the default: raw payloads and termination
+  reasons are omitted, threads/frames are bounded, and diagnostic payloads
+  receive stable event IDs so OS redelivery is idempotent at ingestion.
 - Bounded transient retries for timeouts, rate limits, and server errors, with
   support for `Retry-After`.
 
 `captureException` is a handled report; it is not an automatic fatal-crash
-handler. MetricKit is the opt-in source for OS-delivered diagnostics. Automatic
-screen timing, URLSession timing, and a persistent offline queue are not
-included in the current package.
+handler. Set its policy to `typeAndStacktrace` when error text has not received a
+privacy review. MetricKit is the opt-in source for OS-delivered diagnostics and
+uses that safe policy by default. Automatic screen timing, URLSession timing,
+and a persistent offline queue are not included in the current package.
 
 ## Install
 
@@ -43,7 +45,7 @@ Add the public Swift package with Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.2.0")
+    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.3.0")
 ]
 ```
 
@@ -54,7 +56,7 @@ Then depend on the library product:
 ```
 
 - Swift Package Manager URL: https://github.com/taimoorq/logister-ios.git
-- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.2.0
+- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.3.0
 - iOS integration docs: https://logister.org/docs/integrations/ios/
 
 ## Quick start
@@ -94,7 +96,9 @@ func sendReadmeTest(using appBackend: any AppBackend) async throws {
         release: Bundle.main.object(
             forInfoDictionaryKey: "CFBundleShortVersionString"
         ) as? String,
-        service: Bundle.main.bundleIdentifier
+        service: Bundle.main.bundleIdentifier,
+        exceptionDataPolicy: .typeAndStacktrace,
+        platformContextPolicy: .minimized
     )
 
     let response = try await logister.captureException(
@@ -113,7 +117,7 @@ func sendReadmeTest(using appBackend: any AppBackend) async throws {
 }
 ```
 
-Open the Logister project inbox and confirm that **README test error** appears. If the response is not accepted, check the base URL, token expiry, and your backend's mobile-token response before changing SDK code.
+Open the Logister project inbox and confirm that the handled Swift error appears. With the safe policy, the event identifies the error type without sending the localized **README test error** text. If the response is not accepted, check the base URL, token expiry, and your backend's mobile-token response before changing SDK code.
 
 ## Basic Usage
 
@@ -132,7 +136,9 @@ let client = LogisterClient(
     commitSHA: "4f8c2d1",
     branch: "main",
     service: Bundle.main.bundleIdentifier,
-    retryPolicy: .default
+    retryPolicy: .default,
+    exceptionDataPolicy: .typeAndStacktrace,
+    platformContextPolicy: .minimized
 )
 
 try await client.captureMessage(
@@ -163,11 +169,13 @@ When the Logister project is connected to a GitHub repository, `repository`,
 right code. CI/CD systems should record release-to-commit deployment mappings
 with the Logister HTTP API `POST /api/v1/deployments` endpoint.
 
-The package derives the bundle identifier, app version/build, Apple platform,
-OS version/build, device model/family, architecture, locale, SDK version, and a
-default `version+build` release from the running app. Supply overrides only when
-your release model requires them. Never send IDFA, raw IDFV, serial numbers, or
-another stable hardware identifier; the SDK recursively removes common aliases.
+The standard platform policy derives the bundle identifier, app version/build,
+Apple platform, OS version/build, device model/family, architecture, locale, SDK
+version, and a default `version+build` release. The minimized policy retains
+compatibility context but omits exact model, locale, architecture, and OS build.
+Supply overrides only when your release model requires them. Never send IDFA,
+raw IDFV, serial numbers, or another stable hardware identifier; the SDK
+recursively removes common aliases.
 
 ## MetricKit diagnostics
 
@@ -184,6 +192,7 @@ final class AppDiagnostics {
     init(client: LogisterClient) {
         metricKitCollector = LogisterMetricKitCollector(
             client: client,
+            dataPolicy: .typeAndStacktrace,
             onUploadError: { message in
                 // Record locally without including credentials or payload data.
                 print("MetricKit upload failed: \(message)")
@@ -202,7 +211,9 @@ MetricKit delivery is delayed and controlled by the operating system. It is not
 a real-time crash callback. The collector uploads each crash, hang,
 CPU-exception, and disk-write diagnostic through the normal short-lived-token
 path and uses a deterministic event UUID so a repeated payload does not create
-another Logister occurrence.
+another Logister occurrence. Safe mode sends normalized exception type, codes,
+signals, and bounded frames without the raw MetricKit payload or termination
+reason. Use `.full` only after reviewing those fields for the app's data policy.
 
 For address-only production frames, upload the matching zipped dSYM from the
 exported Xcode archive in Project Settings → Integrations. Logister verifies the binary UUID and

@@ -5,7 +5,7 @@ import Darwin
 
 enum LogisterSDK {
     static let name = "logister-ios"
-    static let version = "0.2.0"
+    static let version = "0.3.0"
     static let telemetrySchemaVersion = 2
 }
 
@@ -99,7 +99,10 @@ enum LogisterPlatformContext {
         #endif
     }
 
-    static func context(service: String?) -> LogisterContext {
+    static func context(
+        service: String?,
+        policy: LogisterPlatformContextPolicy = .standard
+    ) -> LogisterContext {
         let bundle = Bundle.main
         let identifier = bundle.bundleIdentifier ?? service
         let versionName = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
@@ -112,18 +115,20 @@ enum LogisterPlatformContext {
         put(versionName, into: &app, key: "version_name")
         put(versionCode, into: &app, key: "version_code")
 
-        var device: LogisterContext = [
-            "family": .string(deviceFamily),
-            "architecture": .string(architecture),
-            "locale": .string(Locale.current.identifier)
-        ]
-        put(machineModel, into: &device, key: "model")
+        var device: LogisterContext = ["family": .string(deviceFamily)]
+        if policy == .standard {
+            device["architecture"] = .string(architecture)
+            device["locale"] = .string(Locale.current.identifier)
+            put(machineModel, into: &device, key: "model")
+        }
 
         var os: LogisterContext = [
             "name": .string(osName),
             "version": .string(osVersion)
         ]
-        put(osBuild, into: &os, key: "build")
+        if policy == .standard {
+            put(osBuild, into: &os, key: "build")
+        }
 
         return [
             "telemetry_schema_version": .number(Double(LogisterSDK.telemetrySchemaVersion)),
@@ -134,7 +139,8 @@ enum LogisterPlatformContext {
             "os": .object(os),
             "sdk": .object([
                 "name": .string(LogisterSDK.name),
-                "version": .string(LogisterSDK.version)
+                "version": .string(LogisterSDK.version),
+                "platform_context_policy": .string(policy.rawValue)
             ])
         ]
     }
@@ -183,8 +189,10 @@ enum LogisterPrivacySanitizer {
 }
 
 enum LogisterStackFrameParser {
+    private static let maximumFrames = 100
+
     static func frames(from symbols: [String], applicationImage: String?) -> [LogisterValue] {
-        symbols.enumerated().map { index, raw in
+        symbols.prefix(maximumFrames).enumerated().map { index, raw in
             let components = raw.split(maxSplits: 3, whereSeparator: \Character.isWhitespace).map(String.init)
             let image = components.count > 1 ? components[1] : nil
             let address = components.count > 2 && components[2].hasPrefix("0x") ? components[2] : nil

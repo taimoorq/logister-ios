@@ -58,7 +58,7 @@ final class LogisterClientTests: XCTestCase {
 
         XCTAssertTrue(response.accepted)
         XCTAssertEqual(transport.request?.value(forHTTPHeaderField: "Authorization"), "Bearer mobile-token-1")
-        XCTAssertEqual(transport.request?.value(forHTTPHeaderField: "User-Agent"), "logister-ios/0.2.0")
+        XCTAssertEqual(transport.request?.value(forHTTPHeaderField: "User-Agent"), "logister-ios/0.3.0")
         let fetchCount = await tokenProvider.fetchCount
         XCTAssertEqual(fetchCount, 1)
 
@@ -157,9 +157,58 @@ final class LogisterClientTests: XCTestCase {
         XCTAssertEqual(errorContext["mechanism"] as? String, "handled_exception")
         XCTAssertEqual(errorContext["handled"] as? Bool, true)
         XCTAssertEqual(errorContext["fatal"] as? Bool, false)
+        XCTAssertEqual(errorContext["capture_source"] as? String, "manual")
+        XCTAssertEqual(errorContext["data_policy"] as? String, "full")
         XCTAssertEqual(diagnostic["source"] as? String, "sdk")
         XCTAssertEqual(diagnostic["kind"] as? String, "reported_error")
         XCTAssertEqual(threads.first?["triggered"] as? Bool, true)
+    }
+
+    func testSafeExceptionPolicyOmitsRawErrorTextAndMetadata() async throws {
+        let transport = CapturingTransport()
+        let client = LogisterClient(
+            endpoint: URL(string: "https://logister.example/api/v1/ingest_events")!,
+            tokenProvider: SequenceTokenProvider(tokens: [
+                LogisterToken(token: "mobile-token-1", expiresAt: Date().addingTimeInterval(300))
+            ]),
+            exceptionDataPolicy: .typeAndStacktrace,
+            platformContextPolicy: .minimized,
+            transport: transport
+        )
+        let secret = "Bearer private-token-value"
+
+        try await client.captureException(
+            NSError(
+                domain: "private.account.domain",
+                code: 42,
+                userInfo: [NSLocalizedDescriptionKey: secret]
+            )
+        )
+
+        let envelope = try transport.envelope()
+        let serialized = String(
+            data: try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys]),
+            encoding: .utf8
+        )!
+        let event = try XCTUnwrap(envelope["event"] as? [String: Any])
+        let context = try XCTUnwrap(event["context"] as? [String: Any])
+        let exception = try XCTUnwrap(context["exception"] as? [String: Any])
+        let errorContext = try XCTUnwrap(context["error"] as? [String: Any])
+        let device = try XCTUnwrap(context["device"] as? [String: Any])
+        let os = try XCTUnwrap(context["os"] as? [String: Any])
+
+        XCTAssertFalse(serialized.contains(secret))
+        XCTAssertFalse(serialized.contains("private.account.domain"))
+        XCTAssertNil(exception["message"])
+        XCTAssertNil(exception["domain"])
+        XCTAssertNil(exception["code"])
+        XCTAssertNotNil(exception["type"])
+        XCTAssertNotNil(exception["stacktrace"])
+        XCTAssertEqual(errorContext["data_policy"] as? String, "type_and_stacktrace")
+        XCTAssertNil(device["model"])
+        XCTAssertNil(device["locale"])
+        XCTAssertNil(device["architecture"])
+        XCTAssertNil(os["build"])
     }
 
     func testCaptureAddsBoundedCorrelationBreadcrumbsAndRemovesSensitiveIdentifiers() async throws {
@@ -222,6 +271,7 @@ final class LogisterClientTests: XCTestCase {
         let payload: [String: Any] = [
             "exceptionType": 1,
             "exceptionCode": 2,
+            "terminationReason": "private diagnostic detail",
             "callStackTree": [
                 "callStackPerThread": true,
                 "callStacks": [[
@@ -263,9 +313,13 @@ final class LogisterClientTests: XCTestCase {
         )
         XCTAssertEqual(error["mechanism"] as? String, "native_crash")
         XCTAssertEqual(error["fatal"] as? Bool, true)
+        XCTAssertEqual(error["capture_source"] as? String, "metrickit")
+        XCTAssertEqual(error["data_policy"] as? String, "type_and_stacktrace")
         XCTAssertEqual(threads.first?["triggered"] as? Bool, true)
         XCTAssertEqual(frames.first?["image_uuid"] as? String, "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")
         XCTAssertEqual((context["symbolication"] as? [String: Any])?["status"] as? String, "missing")
+        XCTAssertNil((context["termination"] as? [String: Any])?["reason"])
+        XCTAssertNil(context["metrickit"])
     }
 
     func testTokenCaching() async throws {
