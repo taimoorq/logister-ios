@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.5.0 - 2026-08-09
+
+- Normalized MetricKit diagnostics as crash, hang, excessive CPU, excessive disk writes, and slow launch instead of forcing resource and performance evidence through exception semantics.
+- Added bounded hierarchical call-stack trees with attributed/sample roles and sample counts while retaining the flattened compatibility view.
+- Added canonical seconds/bytes measurements for hang duration, CPU time, sampled time, disk writes, and launch duration.
+- Preserved addresses and binary-relative offsets as lossless hexadecimal strings and added stable signatures for attributed sampled paths.
+- Stopped inferring fatality or user impact when Apple evidence does not provide it, and added iOS 16+ slow-launch collection to the MetricKit subscriber.
+- Added explicit session-start timing for trustworthy early-session analysis when session correlation is enabled.
+
+## v0.4.0 - 2026-08-09
+
+- Added telemetry schema v3 evidence with SDK-owned stable UUIDs, exact capture times, and producer metadata.
+- Added source reporting intervals for MetricKit diagnostics while omitting misleading point-in-time occurrence timestamps.
+- Preserved MetricKit source, kind, capture mode, and stable retry identity in the additive evidence envelope.
+- Added an actor-owned, endpoint/app/client/process-scoped durable queue in Application Support, excluded it from backup, persisted before authentication, and added relaunch replay, local dedupe, bounded retention/backpressure, retry scheduling, one-time `401` refresh, and permanent-response discard.
+- Added runtime collection disable/purge, an opt-in rotating delivery-installation pseudonym, recursive credential/URL scrubbing, payload budgets, an immutable final `beforeSend` hook, and bounded client health.
+- Preserved MetricKit payload reporting boundaries, source app build/device/OS/TestFlight metadata, and privacy-filtered immutable source evidence without copying uploader-time app/device/release facts.
+- Made MetricKit subscription and upload-task lifecycle main-actor owned and bundled a privacy manifest that declares diagnostic, usage, optional identifier, and custom-data capabilities with no tracking domains or required-reason APIs.
+
 ## v0.3.0 - 2026-07-29
 
 - Added explicit full and type-and-stacktrace exception data policies. The safe

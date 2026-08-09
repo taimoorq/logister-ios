@@ -5,8 +5,8 @@ import Darwin
 
 enum LogisterSDK {
     static let name = "logister-ios"
-    static let version = "0.3.0"
-    static let telemetrySchemaVersion = 2
+    static let version = "0.5.0"
+    static let telemetrySchemaVersion = 3
 }
 
 enum LogisterPlatformContext {
@@ -174,6 +174,79 @@ enum LogisterPrivacySanitizer {
             guard !disallowedKeys.contains(normalized) else { return }
             result[entry.key] = sanitize(entry.value)
         }
+    }
+
+    static func sanitizePayload(
+        _ context: LogisterContext,
+        policy: LogisterPayloadPolicy
+    ) -> LogisterContext? {
+        var remaining = policy.maximumItems
+        return sanitizeObject(context, policy: policy, remaining: &remaining, depth: 0)
+    }
+
+    private static func sanitizeObject(
+        _ context: LogisterContext,
+        policy: LogisterPayloadPolicy,
+        remaining: inout Int,
+        depth: Int
+    ) -> LogisterContext {
+        guard depth < policy.maximumDepth else { return ["_truncated": .bool(true)] }
+        var result: LogisterContext = [:]
+        for key in context.keys.sorted() {
+            guard remaining > 0 else { break }
+            remaining -= 1
+            let deviceKey = key.lowercased().filter { $0.isLetter || $0.isNumber }
+            let sensitiveKey = LogisterPayloadPolicy.normalizedKey(key)
+            guard !disallowedKeys.contains(deviceKey), !policy.sensitiveKeys.contains(sensitiveKey),
+                  let value = context[key] else { continue }
+            result[key] = sanitizeValue(value, policy: policy, remaining: &remaining, depth: depth + 1)
+        }
+        return result
+    }
+
+    private static func sanitizeValue(
+        _ value: LogisterValue,
+        policy: LogisterPayloadPolicy,
+        remaining: inout Int,
+        depth: Int
+    ) -> LogisterValue {
+        switch value {
+        case .object(let object):
+            return .object(sanitizeObject(object, policy: policy, remaining: &remaining, depth: depth))
+        case .array(let values):
+            guard depth < policy.maximumDepth else { return .array([.string("[TRUNCATED]")]) }
+            var result: [LogisterValue] = []
+            for value in values {
+                guard remaining > 0 else { break }
+                remaining -= 1
+                result.append(sanitizeValue(value, policy: policy, remaining: &remaining, depth: depth + 1))
+            }
+            return .array(result)
+        case .string(let string):
+            return .string(scrub(string, maximumLength: policy.maximumStringLength))
+        default:
+            return value
+        }
+    }
+
+    private static func scrub(_ value: String, maximumLength: Int) -> String {
+        var result = value.replacingOccurrences(
+            of: #"(?i)bearer\s+[^\s]+"#,
+            with: "Bearer [REDACTED]",
+            options: .regularExpression
+        )
+        if let expression = try? NSRegularExpression(pattern: #"https?://[^\s]+"#, options: [.caseInsensitive]) {
+            let range = NSRange(result.startIndex..., in: result)
+            for match in expression.matches(in: result, range: range).reversed() {
+                guard let swiftRange = Range(match.range, in: result),
+                      var components = URLComponents(string: String(result[swiftRange])) else { continue }
+                components.query = nil
+                components.fragment = nil
+                if let replacement = components.string { result.replaceSubrange(swiftRange, with: replacement) }
+            }
+        }
+        guard result.count > maximumLength else { return result }
+        return String(result.prefix(maximumLength)) + "…"
     }
 
     private static func sanitize(_ value: LogisterValue) -> LogisterValue {

@@ -51,6 +51,8 @@ jobs:
           expected="$(tr -d '[:space:]' < VERSION)"
           actual="${{ steps.release_version.outputs.version }}"
 
+          bash scripts/validate-release-metadata.sh
+
           if [ -z "$expected" ]; then
             echo "::error::Missing VERSION file content."
             exit 1
@@ -63,6 +65,11 @@ jobs:
 
           if ! grep -Fq "static let version = \"$expected\"" Sources/Logister/LogisterPlatformContext.swift; then
             echo "::error::LogisterSDK.version does not match VERSION $expected."
+            exit 1
+          fi
+
+          if [ "$GITHUB_REF_TYPE" != "tag" ] || [ "$GITHUB_REF_NAME" != "v$actual" ]; then
+            echo "::error::Release v$actual must run from its exact tag, not $GITHUB_REF."
             exit 1
           fi
 

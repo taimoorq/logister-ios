@@ -1,0 +1,23 @@
+name: Upstream release impact
+
+on:
+  repository_dispatch:
+    types: [logister-release-impact]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  validate:
+    uses: taimoorq/logister/.github/workflows/addon-impact-check.yml@main
+    with:
+      component: ${{ github.event.client_payload.component }}
+      backend_version: ${{ github.event.client_payload.backend_version }}
+      backend_tag: ${{ github.event.client_payload.backend_tag }}
+      backend_sha: ${{ github.event.client_payload.backend_sha }}
+      release_set_url: ${{ github.event.client_payload.release_set_url }}
+      release_set_sha256: ${{ github.event.client_payload.release_set_sha256 }}
+      baseline_version: ${{ github.event.client_payload.baseline_version }}
+      target_version: ${{ github.event.client_payload.target_version }}
+      bump: ${{ github.event.client_payload.bump }}

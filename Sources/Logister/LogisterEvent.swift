@@ -9,6 +9,7 @@ public struct LogisterEventOptions: Equatable, Sendable {
     public var traceID: String?
     public var requestID: String?
     public var sessionID: String?
+    public var sessionStartedAt: Date?
     public var installationIDHash: String?
     public var userID: String?
     public var distributionChannel: String?
@@ -27,6 +28,7 @@ public struct LogisterEventOptions: Equatable, Sendable {
         traceID: String? = nil,
         requestID: String? = nil,
         sessionID: String? = nil,
+        sessionStartedAt: Date? = nil,
         installationIDHash: String? = nil,
         userID: String? = nil,
         distributionChannel: String? = nil,
@@ -44,6 +46,7 @@ public struct LogisterEventOptions: Equatable, Sendable {
         self.traceID = traceID
         self.requestID = requestID
         self.sessionID = sessionID
+        self.sessionStartedAt = sessionStartedAt
         self.installationIDHash = installationIDHash
         self.userID = userID
         self.distributionChannel = distributionChannel

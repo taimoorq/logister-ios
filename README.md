@@ -26,18 +26,26 @@ Apple app → Logister ingest endpoint with the short-lived token
 - Explicit handled/fatal semantics, structured threads and frames, bounded
   breadcrumbs, and opt-in session, rotating installation-hash, distribution,
   foreground, and source context.
-- An opt-in MetricKit collector for crash, hang, CPU-exception, and disk-write
-  diagnostics. Safe collection is the default: raw payloads and termination
-  reasons are omitted, threads/frames are bounded, and diagnostic payloads
-  receive stable event IDs so OS redelivery is idempotent at ingestion.
+- An opt-in MetricKit collector for crash, hang, excessive-CPU, excessive-disk-write,
+  and slow-launch
+  diagnostics. Safe collection is the default: private reason text is omitted,
+  hierarchical sampled call trees and typed measurements are bounded, raw
+  addresses retain lossless hexadecimal identity, source reporting/build/device
+  metadata is retained, and diagnostics receive stable IDs so OS redelivery is
+  idempotent. Resource and launch diagnostics do not invent fatality.
+- Actor-owned durable, bounded, process-local delivery scoped by endpoint,
+  application/service, and optional client scope; tokens are never persisted.
 - Bounded transient retries for timeouts, rate limits, and server errors, with
-  support for `Retry-After`.
+  `Retry-After`, one-time `401` refresh, and poison-response discard.
+- Runtime collection disable/purge, an opt-in rotating delivery-installation
+  pseudonym, recursive credential/URL redaction, payload budgets, a final
+  `beforeSend` hook, and a non-sensitive health snapshot.
 
 `captureException` is a handled report; it is not an automatic fatal-crash
 handler. Set its policy to `typeAndStacktrace` when error text has not received a
 privacy review. MetricKit is the opt-in source for OS-delivered diagnostics and
-uses that safe policy by default. Automatic screen timing, URLSession timing,
-and a persistent offline queue are not included in the current package.
+uses that safe policy by default. Automatic screen timing and URLSession timing
+are not included in the current package.
 
 ## Install
 
@@ -45,7 +53,7 @@ Add the public Swift package with Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.3.0")
+    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.5.0")
 ]
 ```
 
@@ -56,7 +64,7 @@ Then depend on the library product:
 ```
 
 - Swift Package Manager URL: https://github.com/taimoorq/logister-ios.git
-- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.3.0
+- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.5.0
 - iOS integration docs: https://logister.org/docs/integrations/ios/
 
 ## Quick start
@@ -138,7 +146,16 @@ let client = LogisterClient(
     service: Bundle.main.bundleIdentifier,
     retryPolicy: .default,
     exceptionDataPolicy: .typeAndStacktrace,
-    platformContextPolicy: .minimized
+    platformContextPolicy: .minimized,
+    configuration: LogisterConfiguration(
+        // Set this when one app configures multiple logical Logister clients.
+        storageScope: "primary-mobile-project",
+        installationTrackingEnabled: true,
+        beforeSend: { event in
+            // Synchronously redact or return nil to discard. Do not do I/O.
+            event
+        }
+    )
 )
 
 try await client.captureMessage(
@@ -177,6 +194,29 @@ Supply overrides only when your release model requires them. Never send IDFA,
 raw IDFV, serial numbers, or another stable hardware identifier; the SDK
 recursively removes common aliases.
 
+Every event receives its UUID and exact capture date before asynchronous work,
+then is persisted before token acquisition or network delivery. The queue lives
+in Application Support, is excluded from backup, and is scoped by endpoint,
+bundle/service, optional `storageScope`, and process name. The main app and each
+extension therefore own separate queues; sharing one queue through an App Group
+across multiple processes is intentionally unsupported. A custom App Group
+directory is suitable only with a distinct scope per process.
+
+Call `flushQueuedEvents()` after authentication to force a retry. A queued
+response has `deliveryState == .queued` and `accepted == false`. Call
+`setCollectionEnabled(false)` to stop capture and, by default, purge this
+client's queue and rotating installation pseudonym. `healthSnapshot()` exposes
+only collection state, queue/drop counts, last delivery/error, MetricKit
+subscription, decoder, and installation-capability state.
+
+The optional installation pseudonym is random, endpoint/project/process scoped,
+rotated, and labeled `delivery_installation`; it is not IDFA, IDFV, or a
+historical MetricKit source session. `LogisterPayloadPolicy` bounds depth, item
+count, strings, and envelope bytes and removes common credential keys, Bearer
+values, URL query data, IDFA/IDFV, and hardware identifiers. The final
+`beforeSend` result is sanitized again and cannot replace UUID, occurrence-time
+precision, or evidence provenance.
+
 ## MetricKit diagnostics
 
 Keep one collector alive for the app lifetime and start it after creating the
@@ -209,17 +249,56 @@ final class AppDiagnostics {
 
 MetricKit delivery is delayed and controlled by the operating system. It is not
 a real-time crash callback. The collector uploads each crash, hang,
-CPU-exception, and disk-write diagnostic through the normal short-lived-token
+excessive-CPU, excessive-disk-write, and iOS 16+ slow-launch diagnostic through the normal short-lived-token
 path and uses a deterministic event UUID so a repeated payload does not create
 another Logister occurrence. Safe mode sends normalized exception type, codes,
-signals, and bounded frames without the raw MetricKit payload or termination
-reason. Use `.full` only after reviewing those fields for the app's data policy.
+signals, privacy-filtered immutable source evidence, bounded frames, sampled
+call trees, and typed measurements without
+termination or exception reason text. The collector carries the payload's
+reporting interval and source app version/build, hardware identifier, OS build,
+architecture, and TestFlight flag; it never substitutes uploader-time app,
+device, release, or occurrence facts. Use `.full` only after reviewing those
+fields for the app's data policy.
 
 For address-only production frames, upload the matching zipped dSYM from the
-exported Xcode archive in Project Settings → Integrations. Logister verifies the binary UUID and
-architecture in private archive storage. App Store Connect power/performance
+exported Xcode archive from the project's **Artifacts** page or trusted CI.
+Logister verifies the binary UUID and architecture in private archive storage,
+then resolves eligible stored frames on an Apple-toolchain worker while
+preserving every raw address.
+App Store Connect power/performance
 reports are configured in the same settings area but remain a separate,
 freshness-labelled aggregate; they are not added to SDK or MetricKit counts.
+
+## dSYM upload in CI
+
+Archive the exact dSYM produced by the release build, read its UUID and
+architecture with `dwarfdump`, and upload it with a separately scoped Logister
+CLI token. For example, an Xcode Cloud or CI step can run:
+
+```bash
+DSYM_PATH="$ARCHIVE_PATH/dSYMs/Shop.app.dSYM"
+DSYM_ZIP="$RUNNER_TEMP/Shop.app.dSYM.zip"
+ditto -c -k --keepParent "$DSYM_PATH" "$DSYM_ZIP"
+dwarfdump --uuid "$DSYM_PATH"
+
+LOGISTER_HOST=https://logister.example.com \
+LOGISTER_TOKEN="$LOGISTER_ARTIFACT_TOKEN" \
+logister artifacts upload-ios \
+  --project "$LOGISTER_PROJECT" \
+  --file "$DSYM_ZIP" \
+  --app-identifier com.acme.shop \
+  --version-name "$MARKETING_VERSION" \
+  --version-code "$CURRENT_PROJECT_VERSION" \
+  --binary-uuid AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE \
+  --architecture arm64
+```
+
+Invoke the upload once for each binary UUID and architecture represented by the
+archive, including app extensions and embedded frameworks. Use an expiring,
+project-limited CLI token approved with the additive `artifacts:write` scope;
+never reuse the app's mobile ingest token or embed the CI token in the app.
+Verification proves that the uploaded artifact contains the declared binary
+identity. It does not, by itself, mean existing events have been symbolicated.
 
 ## Delivery behavior
 
@@ -239,9 +318,20 @@ let client = LogisterClient(
 )
 ```
 
-A non-2xx response remains non-accepted, and an exhausted transport failure is
-still thrown to the caller. The package does not silently report queued delivery
-as server acceptance.
+A permanent non-2xx response remains non-accepted and is removed so it cannot
+block later envelopes. An exhausted transient or authentication failure remains
+durably queued. The package never reports queued delivery as server acceptance.
+
+## Privacy manifest
+
+The package bundles `PrivacyInfo.xcprivacy` as an explicit Swift Package
+resource. It declares diagnostic/performance/product-interaction data, optional
+user and random device identifiers, and custom event data because host apps can
+enable or provide those fields. These are declared as potentially linked,
+non-tracking data used for app functionality (and analytics where applicable).
+The manifest declares no tracking domains and no required-reason APIs. Generate
+and review the consuming app's Xcode privacy report whenever host collection
+changes; the app publisher remains responsible for its App Store privacy label.
 
 ## Spans And Check-ins
 

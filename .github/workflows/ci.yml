@@ -22,6 +22,9 @@ jobs:
       - name: Secret scan
         run: bash scripts/secret-scan.sh
 
+      - name: Validate release metadata
+        run: bash scripts/validate-release-metadata.sh
+
       - name: Run tests
         run: swift test
 
