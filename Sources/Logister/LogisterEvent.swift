@@ -28,7 +28,46 @@ public struct LogisterEventOptions: Equatable, Sendable {
         traceID: String? = nil,
         requestID: String? = nil,
         sessionID: String? = nil,
-        sessionStartedAt: Date? = nil,
+        installationIDHash: String? = nil,
+        userID: String? = nil,
+        distributionChannel: String? = nil,
+        inForeground: Bool? = nil,
+        transactionName: String? = nil,
+        durationMs: Double? = nil,
+        breadcrumbs: [LogisterBreadcrumb] = [],
+        context: LogisterContext = [:]
+    ) {
+        self.init(
+            level: level,
+            fingerprint: fingerprint,
+            occurredAt: occurredAt,
+            environment: environment,
+            release: release,
+            traceID: traceID,
+            requestID: requestID,
+            sessionID: sessionID,
+            sessionStartedAt: nil,
+            installationIDHash: installationIDHash,
+            userID: userID,
+            distributionChannel: distributionChannel,
+            inForeground: inForeground,
+            transactionName: transactionName,
+            durationMs: durationMs,
+            breadcrumbs: breadcrumbs,
+            context: context
+        )
+    }
+
+    public init(
+        level: String? = nil,
+        fingerprint: String? = nil,
+        occurredAt: Date? = nil,
+        environment: String? = nil,
+        release: String? = nil,
+        traceID: String? = nil,
+        requestID: String? = nil,
+        sessionID: String? = nil,
+        sessionStartedAt: Date?,
         installationIDHash: String? = nil,
         userID: String? = nil,
         distributionChannel: String? = nil,

@@ -1,6 +1,10 @@
 # Changelog
 
-## v0.5.0 - 2026-08-09
+## v0.5.0 - 2026-09-11
+
+- Kept internal beforeSend discard signaling private and restored the initializer symbols from 0.3.0.
+- Documented the deliberate pre-1.0 migration to immutable endpoints and main-actor MetricKit lifecycle, with a narrowly scoped API diagnostic allowlist.
+- Restored explicit release dispatch, exact-tag recovery, and weekly verification without scheduled publication.
 
 - Normalized MetricKit diagnostics as crash, hang, excessive CPU, excessive disk writes, and slow launch instead of forcing resource and performance evidence through exception semantics.
 - Added bounded hierarchical call-stack trees with attributed/sample roles and sample counts while retaining the flattened compatibility view.

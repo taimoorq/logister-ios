@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   validate:
-    uses: taimoorq/logister/.github/workflows/addon-impact-check.yml@main
+    uses: taimoorq/logister/.github/workflows/addon-impact-check.yml@269fa97947fcdc7e1c4b4f0c4646e234db1880ee # Rails 3.6.11; verified production release
     with:
       component: ${{ github.event.client_payload.component }}
       backend_version: ${{ github.event.client_payload.backend_version }}

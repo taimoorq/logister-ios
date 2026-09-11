@@ -21,4 +21,10 @@ if [ -z "$baseline_tag" ]; then
 fi
 
 echo "Checking public API compatibility against $baseline_tag"
-swift package diagnose-api-breaking-changes "$baseline_tag"
+arguments=()
+# Two reviewed changes accompany the pre-1.0 minor migration. Keep this limited
+# to that exact transition; new breakages still fail and future baselines reset it.
+if [ "$baseline_tag" = "v0.3.0" ] && [ "$current_version" = "0.5.0" ]; then
+  arguments+=(--breakage-allowlist-path scripts/api-breakages-0.3-to-0.5.txt)
+fi
+swift package diagnose-api-breaking-changes "${arguments[@]}" "$baseline_tag"

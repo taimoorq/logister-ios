@@ -9,11 +9,15 @@ public struct LogisterResponse: Equatable, Sendable {
     public var headers: [String: String]
     public var deliveryState: LogisterDeliveryState
 
+    public init(statusCode: Int, body: Data = Data(), headers: [String: String] = [:]) {
+        self.init(statusCode: statusCode, body: body, headers: headers, deliveryState: nil)
+    }
+
     public init(
         statusCode: Int,
         body: Data = Data(),
         headers: [String: String] = [:],
-        deliveryState: LogisterDeliveryState? = nil
+        deliveryState: LogisterDeliveryState?
     ) {
         self.statusCode = statusCode
         self.body = body
@@ -71,7 +75,10 @@ public enum LogisterError: Error, Equatable {
     case invalidPayload
     case invalidResponse
     case invalidMobileIngestToken
-    case discardedByBeforeSend
+}
+
+private enum CaptureDiscard: Error {
+    case beforeSend
 }
 
 public protocol LogisterTransport: Sendable {
@@ -186,6 +193,139 @@ public struct LogisterClient: Sendable {
     private let configuration: LogisterConfiguration
     private let runtime: LogisterRuntime
 
+    // Retain the initializer symbols exposed by the last public Swift package.
+    public init(
+        baseURL: URL,
+        tokenProvider: any LogisterTokenProvider,
+        environment: String? = nil,
+        release: String? = nil,
+        repository: String? = nil,
+        commitSHA: String? = nil,
+        branch: String? = nil,
+        service: String? = nil,
+        defaultContext: LogisterContext = [:],
+        tokenRefreshSkew: TimeInterval = 60,
+        retryPolicy: LogisterRetryPolicy = .default,
+        transport: LogisterTransport = URLSessionLogisterTransport()
+    ) {
+        self.init(
+            baseURL: baseURL,
+            tokenProvider: tokenProvider,
+            environment: environment,
+            release: release,
+            repository: repository,
+            commitSHA: commitSHA,
+            branch: branch,
+            service: service,
+            defaultContext: defaultContext,
+            tokenRefreshSkew: tokenRefreshSkew,
+            retryPolicy: retryPolicy,
+            configuration: .default,
+            transport: transport
+        )
+    }
+
+    public init(
+        baseURL: URL,
+        tokenProvider: any LogisterTokenProvider,
+        environment: String? = nil,
+        release: String? = nil,
+        repository: String? = nil,
+        commitSHA: String? = nil,
+        branch: String? = nil,
+        service: String? = nil,
+        defaultContext: LogisterContext = [:],
+        tokenRefreshSkew: TimeInterval = 60,
+        retryPolicy: LogisterRetryPolicy = .default,
+        exceptionDataPolicy: LogisterExceptionDataPolicy,
+        platformContextPolicy: LogisterPlatformContextPolicy = .standard,
+        transport: LogisterTransport = URLSessionLogisterTransport()
+    ) {
+        self.init(
+            baseURL: baseURL,
+            tokenProvider: tokenProvider,
+            environment: environment,
+            release: release,
+            repository: repository,
+            commitSHA: commitSHA,
+            branch: branch,
+            service: service,
+            defaultContext: defaultContext,
+            tokenRefreshSkew: tokenRefreshSkew,
+            retryPolicy: retryPolicy,
+            exceptionDataPolicy: exceptionDataPolicy,
+            platformContextPolicy: platformContextPolicy,
+            configuration: .default,
+            transport: transport
+        )
+    }
+
+    public init(
+        endpoint: URL,
+        tokenProvider: any LogisterTokenProvider,
+        environment: String? = nil,
+        release: String? = nil,
+        repository: String? = nil,
+        commitSHA: String? = nil,
+        branch: String? = nil,
+        service: String? = nil,
+        defaultContext: LogisterContext = [:],
+        tokenRefreshSkew: TimeInterval = 60,
+        retryPolicy: LogisterRetryPolicy = .default,
+        transport: LogisterTransport = URLSessionLogisterTransport()
+    ) {
+        self.init(
+            endpoint: endpoint,
+            tokenProvider: tokenProvider,
+            environment: environment,
+            release: release,
+            repository: repository,
+            commitSHA: commitSHA,
+            branch: branch,
+            service: service,
+            defaultContext: defaultContext,
+            tokenRefreshSkew: tokenRefreshSkew,
+            retryPolicy: retryPolicy,
+            configuration: .default,
+            transport: transport
+        )
+    }
+
+    public init(
+        endpoint: URL,
+        tokenProvider: any LogisterTokenProvider,
+        environment: String? = nil,
+        release: String? = nil,
+        repository: String? = nil,
+        commitSHA: String? = nil,
+        branch: String? = nil,
+        service: String? = nil,
+        defaultContext: LogisterContext = [:],
+        tokenRefreshSkew: TimeInterval = 60,
+        retryPolicy: LogisterRetryPolicy = .default,
+        exceptionDataPolicy: LogisterExceptionDataPolicy,
+        platformContextPolicy: LogisterPlatformContextPolicy = .standard,
+        transport: LogisterTransport = URLSessionLogisterTransport()
+    ) {
+        self.init(
+            endpoint: endpoint,
+            tokenProvider: tokenProvider,
+            environment: environment,
+            release: release,
+            repository: repository,
+            commitSHA: commitSHA,
+            branch: branch,
+            service: service,
+            defaultContext: defaultContext,
+            tokenRefreshSkew: tokenRefreshSkew,
+            retryPolicy: retryPolicy,
+            exceptionDataPolicy: exceptionDataPolicy,
+            platformContextPolicy: platformContextPolicy,
+            configuration: .default,
+            transport: transport
+        )
+    }
+
     @available(*, deprecated, message: "Choose an explicit exceptionDataPolicy and platformContextPolicy.")
     public init(
         baseURL: URL,
@@ -199,7 +339,7 @@ public struct LogisterClient: Sendable {
         defaultContext: LogisterContext = [:],
         tokenRefreshSkew: TimeInterval = 60,
         retryPolicy: LogisterRetryPolicy = .default,
-        configuration: LogisterConfiguration = .default,
+        configuration: LogisterConfiguration,
         transport: LogisterTransport = URLSessionLogisterTransport()
     ) {
         self.init(
@@ -235,7 +375,7 @@ public struct LogisterClient: Sendable {
         retryPolicy: LogisterRetryPolicy = .default,
         exceptionDataPolicy: LogisterExceptionDataPolicy,
         platformContextPolicy: LogisterPlatformContextPolicy = .standard,
-        configuration: LogisterConfiguration = .default,
+        configuration: LogisterConfiguration,
         transport: LogisterTransport = URLSessionLogisterTransport()
     ) {
         self.init(
@@ -270,7 +410,7 @@ public struct LogisterClient: Sendable {
         defaultContext: LogisterContext = [:],
         tokenRefreshSkew: TimeInterval = 60,
         retryPolicy: LogisterRetryPolicy = .default,
-        configuration: LogisterConfiguration = .default,
+        configuration: LogisterConfiguration,
         transport: LogisterTransport = URLSessionLogisterTransport()
     ) {
         self.init(
@@ -306,7 +446,7 @@ public struct LogisterClient: Sendable {
         retryPolicy: LogisterRetryPolicy = .default,
         exceptionDataPolicy: LogisterExceptionDataPolicy,
         platformContextPolicy: LogisterPlatformContextPolicy = .standard,
-        configuration: LogisterConfiguration = .default,
+        configuration: LogisterConfiguration,
         transport: LogisterTransport = URLSessionLogisterTransport()
     ) {
         self.endpoint = endpoint
@@ -342,7 +482,7 @@ public struct LogisterClient: Sendable {
             installationIDHash: captureState.installationIDHash,
             identityEnabled: captureState.identityEnabled
             )
-        } catch LogisterError.discardedByBeforeSend {
+        } catch CaptureDiscard.beforeSend {
             await runtime.recordDiscard(reason: "beforeSend discarded event")
             return .dropped("beforeSend discarded event")
         }
@@ -606,7 +746,7 @@ public struct LogisterClient: Sendable {
             throw LogisterError.invalidPayload
         }
         if let beforeSend = configuration.beforeSend {
-            guard let candidate = beforeSend(processed) else { throw LogisterError.discardedByBeforeSend }
+            guard let candidate = beforeSend(processed) else { throw CaptureDiscard.beforeSend }
             processed = candidate
         }
         processed["uuid"] = payload["uuid"]

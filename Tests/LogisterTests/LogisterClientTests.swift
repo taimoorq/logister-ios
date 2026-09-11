@@ -576,7 +576,8 @@ final class LogisterClientTests: XCTestCase {
             transport: CapturingTransport()
         )
         let eventID = UUID()
-        let occurredAt = Date(timeIntervalSince1970: 1_786_272_000)
+        // Remain within retention while proving replay preserves the original time.
+        let occurredAt = Date().addingTimeInterval(-60)
         let event = LogisterEvent(eventID: eventID, eventType: "log", message: "persist me", occurredAt: occurredAt)
 
         let queued = try await firstClient.capture(event)
