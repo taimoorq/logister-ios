@@ -394,3 +394,38 @@ CI runs `scripts/secret-scan.sh`, and dependency updates are tracked by
 Swift Package Manager distribution from a public GitHub repository does not require a package registry secret. The Git tag is the package release; do not move a tag after consumers could have resolved it.
 
 For server-side token issuance and mobile deployment guidance, read the [iOS integration guide](https://logister.org/docs/integrations/ios/) and the main app's [mobile add-ons reference](https://github.com/taimoorq/logister/blob/main/docs/mobile-add-ons.md).
+
+
+### Migrating from 0.3 to 0.5
+
+The durable queue binds events to the endpoint that captured them. `endpoint` is
+now read-only: create another `LogisterClient` to change servers, rather than
+mutating a client with queued events. This intentional pre-1.0 minor API change
+prevents replay across server boundaries. Existing initializer signatures remain
+available; new configuration and session-start options use additional overloads.
+
+MetricKit subscription and task state are owned by the main actor. Apple may call
+`didReceive` from another executor, so that callback is explicitly nonisolated;
+it snapshots diagnostic bytes before handing work to the main actor. Create,
+start and stop collectors on the main actor. The API gate records these two
+specific migration diagnostics only when comparing 0.5.0 with public 0.3.0;
+other API regressions still fail.
+
+
+### Coordinated release preparation
+
+For a coordinated ecosystem release, keep the version-changing PR unmerged until
+the final agreed Rails PR has been published and its deployment verified. Recheck
+the upstream contract/workflow pin against that final backend commit before merge.
+Successful source CI, a tag, or a release-impact dispatch alone is not backend readiness.
+After independent review, merging the new version runs CI, creates an immutable tag,
+and explicitly dispatches publication. A tag without a package remains incomplete.
+
+To recover an existing reviewed tag, dispatch the publisher workflow from `main`
+with `-f tag=vX.Y.Z` (Python uses `publish.yml`; other SDKs use `release.yml`). The
+workflow checks out that exact tag, proves it belongs to main, and verifies public
+package identity before creating the GitHub Release. Never move a consumed tag.
+
+Weekly CI audits/tests current dependencies and cannot trigger automatic publication.
+Dependabot groups compatible minor/patch updates; major toolchain migrations keep
+separate PRs. Pin Actions to full commits and retain supported runtime floors.

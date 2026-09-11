@@ -1,0 +1,2 @@
+API breakage: accessor LogisterClient.endpoint.Set() has been removed
+API breakage: func LogisterMetricKitCollector.didReceive(_:) is now with nonisolated

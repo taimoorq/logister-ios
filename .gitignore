@@ -20,3 +20,5 @@ AuthKey_*.p8
 private-key.*
 *.mobileprovision
 *.provisionprofile
+
+__pycache__/

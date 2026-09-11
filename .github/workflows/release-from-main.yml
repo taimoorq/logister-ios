@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: release-from-main
@@ -18,7 +19,7 @@ concurrency:
 
 jobs:
   release:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: macos-15
 
     steps:
@@ -66,30 +67,14 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
-      - name: Check existing tag
+      - name: Create or recover immutable release and dispatch publication
         if: steps.main.outputs.current == 'true'
-        id: tag
-        run: |
-          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            git fetch origin "refs/tags/${{ steps.version.outputs.tag }}:refs/tags/${{ steps.version.outputs.tag }}"
-            tagged_sha="$(git rev-list -n 1 "${{ steps.version.outputs.tag }}")"
-            if [ "$tagged_sha" = "${{ github.event.workflow_run.head_sha }}" ]; then
-              echo "::notice::${{ steps.version.outputs.tag }} already identifies this commit. Use the tagged Release workflow for recovery."
-            elif git diff --quiet "$tagged_sha" "${{ github.event.workflow_run.head_sha }}" -- Sources README.md Package.swift; then
-              echo "::notice::Only tooling or test files changed since ${{ steps.version.outputs.tag }}; no release is needed."
-            else
-              echo "::error::Publishable files changed since ${{ steps.version.outputs.tag }}. Bump VERSION and LogisterSDK.version and add changelog notes."
-              exit 1
-            fi
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create release tag and dispatch release
-        if: steps.main.outputs.current == 'true' && steps.tag.outputs.exists != 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${{ steps.version.outputs.tag }}" -m "Release logister-ios ${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: >-
+          python3 scripts/prepare-release.py
+          --tag "$RELEASE_TAG"
+          --workflow release.yml
+          --paths Sources README.md LICENSE CHANGELOG.md Package.swift VERSION
