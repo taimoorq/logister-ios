@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.0 - 2026-09-24
+
+- Add immutable W3C request handles and an opt-in URLSession wrapper with exact-origin allowlists.
+- Attach request identity to handled errors and HTTP spans; return redirects without forwarding trace headers and exclude telemetry endpoints.
+
 ## v0.5.0 - 2026-09-11
 
 - Kept internal beforeSend discard signaling private and restored the initializer symbols from 0.3.0.

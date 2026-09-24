@@ -53,7 +53,7 @@ Add the public Swift package with Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.5.0")
+    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.6.0")
 ]
 ```
 
@@ -64,7 +64,7 @@ Then depend on the library product:
 ```
 
 - Swift Package Manager URL: https://github.com/taimoorq/logister-ios.git
-- Current release: https://github.com/taimoorq/logister-ios/releases/tag/v0.5.0
+- Release version: https://github.com/taimoorq/logister-ios/releases/tag/v0.6.0
 - iOS integration docs: https://logister.org/docs/integrations/ios/
 
 ## Quick start
@@ -429,3 +429,40 @@ package identity before creating the GitHub Release. Never move a consumed tag.
 Weekly CI audits/tests current dependencies and cannot trigger automatic publication.
 Dependabot groups compatible minor/patch updates; major toolchain migrations keep
 separate PRs. Pin Actions to full commits and retain supported runtime floors.
+
+## Request correlation (0.6.0+)
+
+Use the opt-in URLSession wrapper for calls to your backend. Every attempt has
+an immutable handle; unrelated tasks never share a global “last request”.
+
+```swift
+let http = LogisterHTTPClient(
+    client: client,
+    allowedOrigins: [URL(string: "https://api.example.test")!],
+    excludedURLs: [URL(string: "https://api.example.test/mobile-token")!]
+)
+let result = try await http.data(for: URLRequest(url: URL(string: "https://api.example.test/orders")!))
+if let response = result.response as? HTTPURLResponse, response.statusCode >= 500,
+   let trace = result.traceContext {
+    try await client.captureException(URLError(.badServerResponse), options: trace.eventOptions)
+}
+```
+
+Transport failures throw `LogisterHTTPRequestError` with the underlying error and
+optional `traceContext`. Attach that handle to the corresponding handled error.
+The wrapper records HTTP spans, adopts valid existing outbound W3C headers, and
+excludes the SDK's ingest endpoint. List token endpoints explicitly. Redirects
+are returned as 3xx; call the wrapper again after checking the new destination,
+passing `parent: result.traceContext` when it is a continuation. No global
+URLSession instrumentation or automatic MetricKit/crash-to-request matching occurs.
+
+A linked-project lookup also requires Logister 3.7+, the instance flag
+`LOGISTER_CROSS_PROJECT_CORRELATIONS=true`, and explicit project/environment
+connections under Settings → Integrations → Connected projects. Enable related
+requests on both projects. A connection never grants project access.
+
+Use the returned request handle when reporting a handled HTTP failure later.
+Do not attach the most recent request to an unrelated crash or OS diagnostic.
+Configure each app's own `release` and `environment`; mobile and backend releases
+are independent. The backend shows exact identifier evidence and retention gaps.
+See the [request correlation guide](https://logister.org/docs/request-correlation/).
