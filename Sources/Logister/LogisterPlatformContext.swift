@@ -5,7 +5,7 @@ import Darwin
 
 enum LogisterSDK {
     static let name = "logister-ios"
-    static let version = "0.5.0"
+    static let version = "0.6.0"
     static let telemetrySchemaVersion = 3
 }
 
