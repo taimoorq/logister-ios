@@ -50,20 +50,40 @@ public struct LogisterHTTPClient: Sendable {
         let start = ProcessInfo.processInfo.systemUptime
         do {
             let (data, response) = try await session.data(for: request, delegate: NoLogisterRedirects())
-            record(trace, operation: operation, startedAt: startedAt, elapsed: ProcessInfo.processInfo.systemUptime - start, failed: (response as? HTTPURLResponse)?.statusCode ?? 0 >= 500)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode
+            record(trace, operation: operation, method: request.httpMethod ?? "GET", statusCode: statusCode, failureKind: (statusCode ?? 0) >= 400 ? "http" : nil, startedAt: startedAt, elapsed: ProcessInfo.processInfo.systemUptime - start, failed: (statusCode ?? 0) >= 500)
             return LogisterHTTPResult(data: data, response: response, traceContext: trace)
         } catch {
-            record(trace, operation: operation, startedAt: startedAt, elapsed: ProcessInfo.processInfo.systemUptime - start, failed: true)
+            record(trace, operation: operation, method: request.httpMethod ?? "GET", statusCode: nil, failureKind: failureKind(error), startedAt: startedAt, elapsed: ProcessInfo.processInfo.systemUptime - start, failed: true)
             throw LogisterHTTPRequestError(underlying: error, traceContext: trace)
         }
     }
 
-    private func record(_ trace: LogisterTraceContext?, operation: String, startedAt: Date, elapsed: TimeInterval, failed: Bool) {
+    private func failureKind(_ error: any Error) -> String {
+        guard let error = error as? URLError else { return "transport" }
+        switch error.code {
+        case .timedOut: return "timeout"
+        case .cannotFindHost, .dnsLookupFailed: return "dns"
+        case .cancelled: return "cancelled"
+        case .notConnectedToInternet, .networkConnectionLost, .cannotConnectToHost: return "connection"
+        case .secureConnectionFailed, .serverCertificateUntrusted, .serverCertificateHasBadDate,
+             .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid, .clientCertificateRejected,
+             .clientCertificateRequired: return "tls"
+        default: return "transport"
+        }
+    }
+
+    private func record(_ trace: LogisterTraceContext?, operation: String, method: String, statusCode: Int?, failureKind: String?, startedAt: Date, elapsed: TimeInterval, failed: Bool) {
         guard let trace else { return }
         let duration = elapsed * 1_000
+        var metadata: LogisterContext = ["method": .string(String(method.uppercased().prefix(16))), "attempt": .number(1), "duration_scope": .string("response_body")]
+        if let statusCode { metadata["status_code"] = .number(Double(statusCode)) }
+        if let failureKind { metadata["failure_kind"] = .string(failureKind) }
+        var context = trace.context
+        context["http"] = .object(metadata)
         let span = LogisterSpan(traceID: trace.traceID, spanID: trace.spanID, parentSpanID: trace.parentSpanID,
             name: String(operation.prefix(200)), kind: "http", status: failed ? "error" : "ok", durationMs: max(0, duration), startedAt: startedAt,
-            context: trace.context)
+            context: context)
         // Export cannot replace an application response or exception.
         Task { _ = try? await client.captureSpan(span, options: trace.eventOptions) }
     }

@@ -65,7 +65,7 @@ final class LogisterClientTests: XCTestCase {
 
         XCTAssertTrue(response.accepted)
         XCTAssertEqual(transport.request?.value(forHTTPHeaderField: "Authorization"), "Bearer mobile-token-1")
-        XCTAssertEqual(transport.request?.value(forHTTPHeaderField: "User-Agent"), "logister-ios/0.6.0")
+        XCTAssertEqual(transport.request?.value(forHTTPHeaderField: "User-Agent"), "logister-ios/0.6.1")
         let fetchCount = await tokenProvider.fetchCount
         XCTAssertEqual(fetchCount, 1)
 
@@ -358,7 +358,7 @@ final class LogisterClientTests: XCTestCase {
         XCTAssertEqual(evidence["kind"] as? String, "crash")
         XCTAssertEqual(evidence["capture_mode"] as? String, "metrickit_payload")
         XCTAssertEqual((evidence["reporting_period"] as? [String: Any])?["start"] as? String, "2026-08-01T00:00:00Z")
-        XCTAssertEqual((evidence["producer"] as? [String: Any])?["sdk_version"] as? String, "0.6.0")
+        XCTAssertEqual((evidence["producer"] as? [String: Any])?["sdk_version"] as? String, "0.6.1")
     }
 
     func testMetricKitResourceDiagnosticUsesTypedMeasurementsAndSampledTreeWithoutAnException() async throws {
