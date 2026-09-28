@@ -53,7 +53,7 @@ Add the public Swift package with Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.6.0")
+    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.6.1")
 ]
 ```
 
@@ -64,7 +64,7 @@ Then depend on the library product:
 ```
 
 - Swift Package Manager URL: https://github.com/taimoorq/logister-ios.git
-- Release version: https://github.com/taimoorq/logister-ios/releases/tag/v0.6.0
+- Release version: https://github.com/taimoorq/logister-ios/releases/tag/v0.6.1
 - iOS integration docs: https://logister.org/docs/integrations/ios/
 
 ## Quick start
@@ -466,3 +466,19 @@ Do not attach the most recent request to an unrelated crash or OS diagnostic.
 Configure each app's own `release` and `environment`; mobile and backend releases
 are independent. The backend shows exact identifier evidence and retention gaps.
 See the [request correlation guide](https://logister.org/docs/request-correlation/).
+
+### HTTP evidence (0.6.1+)
+
+Traced HTTP spans include optional `context.http` fields: `method`,
+`status_code` when a response is available, `failure_kind`, `attempt`, and
+`duration_scope`. Failure categories distinguish HTTP 4xx/5xx responses from
+transport failures such as timeout, DNS, connection, TLS or cancellation.
+No request/response bodies or headers are added. Operation labels should be
+static and exclude credentials or customer data. Older servers safely accept
+this metadata; Logister 3.8 uses it in connected request and impact views.
+
+URLSession `data(for:)` records `response_body` duration through receipt of the body. Each explicit wrapper call is attempt 1; retries are separate calls.
+
+Client and backend durations measure different work. Do not subtract them to
+estimate network time. A shared identifier establishes related evidence, not
+root cause; omitted fields mean the evidence was not captured.

@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.6.1 - 2026-09-28
+
+- Record optional HTTP method, status code, failure category, attempt number and duration scope on traced calls for connected-project investigation.
+- Preserve application results, origin allowlists, request handles and compatibility with older Logister servers.
+
 ## v0.6.0 - 2026-09-24
 
 - Add immutable W3C request handles and an opt-in URLSession wrapper with exact-origin allowlists.
