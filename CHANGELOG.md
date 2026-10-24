@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.7.0 - 2026-10-23
+
+Security and reliability hardening. Several defaults change; see "Upgrading
+to 0.7.0" in the README.
+
+- Fixed MetricKit crash reports being rejected before delivery. One item
+  budget was spent over alphabetically sorted keys, so a large context used it
+  up before `event_type`, `message` and `uuid`. Envelope fields are now always
+  kept, context has its own budget, the whole event stays within the server's
+  512-key and 1,000,000-byte limits, and anything dropped sets
+  `context._truncated`. Oversized events are shrunk instead of rejected.
+- MetricKit crashes read Apple's `diagnosticMetaData` block, send the crashed
+  thread first, and no longer repeat the linear crash call tree or copy the raw
+  diagnostic into `source_evidence`. In safe mode that raw copy could include
+  termination and Objective-C exception reason text.
+- MetricKit numeric codes and sample counts of 0 or 1 are sent as numbers, not
+  booleans.
+- NaN and infinite numbers are sent as `null`. They previously raised an
+  Objective-C exception that crashed the host app.
+- Sensitive keys follow the shared Logister redaction rule. `accessToken`,
+  `apiKey`, `x-api-key`, `refreshToken`, `clientSecret`, `idToken` and any key
+  containing token, secret, password, passwd, apikey, authorization,
+  credential or cookie are redacted. Their values become `"[REDACTED]"`
+  instead of the key being removed. Strings are scrubbed for Bearer and Basic
+  credentials, JWTs and `lgst_` keys, and URLs lose userinfo as well as query
+  and fragment.
+- The `.full` exception policy sends `localizedDescription`, the NSError domain
+  and code, and a reviewed `userInfo` subset instead of
+  `String(describing:)`. Initializers that do not name a policy, including the
+  deprecated ones, now use `.typeAndStacktrace`.
+- The default transport uses a dedicated ephemeral `URLSession` with 15 s
+  request and 60 s resource timeouts, no cookies or cache, and no redirects.
+- Endpoints must use https unless the host is loopback or
+  `LogisterConfiguration.allowsInsecureTransport` is set.
+- Token provider calls time out after `tokenProviderTimeout` (30 s), and
+  invalidating a token no longer cancels a refresh other callers share.
+- A 401 that persists after the one token refresh keeps the event queued, as
+  documented, instead of discarding it.
+- Computed retry delays are jittered.
+- The durable queue writes one file per event instead of rewriting the whole
+  queue on every change. The previous queue file is migrated on first launch.
+- Internal payload failures return a dropped response instead of throwing.
+
 ## v0.6.1 - 2026-09-28
 
 - Record optional HTTP method, status code, failure category, attempt number and duration scope on traced calls for connected-project investigation.

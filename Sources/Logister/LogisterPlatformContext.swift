@@ -5,7 +5,7 @@ import Darwin
 
 enum LogisterSDK {
     static let name = "logister-ios"
-    static let version = "0.6.1"
+    static let version = "0.7.0"
     static let telemetrySchemaVersion = 3
 }
 
@@ -182,8 +182,7 @@ enum LogisterPrivacySanitizer {
     ]
     /// Identifier values the SDK generates; they are bounded but not scrubbed.
     private static let identifierKeys: Set<String> = [
-        "uuid", "event_type", "occurred_at", "trace_id", "span_id", "parent_span_id",
-        "request_id", "session_id"
+        "uuid", "event_type", "occurred_at", "trace_id", "request_id", "session_id"
     ]
 
     /// SDK-owned context that identifies the event; kept before caller context.
