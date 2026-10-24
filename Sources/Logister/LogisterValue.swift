@@ -30,10 +30,16 @@ public enum LogisterValue: Equatable, Sendable {
         switch jsonObject {
         case let value as String:
             self = .string(value)
+        case let value as NSNumber:
+            // Foundation bridges JSON 0 and 1 to Bool, so only a real
+            // CFBoolean is a boolean; MetricKit codes and counts stay numbers.
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                self = .bool(value.boolValue)
+            } else {
+                self = .number(value.doubleValue)
+            }
         case let value as Bool:
             self = .bool(value)
-        case let value as NSNumber:
-            self = .number(value.doubleValue)
         case let value as [String: Any]:
             self = .object(value.reduce(into: LogisterContext()) { result, entry in
                 if let converted = LogisterValue(jsonObject: entry.value) {

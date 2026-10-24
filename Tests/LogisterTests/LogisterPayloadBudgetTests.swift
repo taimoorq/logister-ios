@@ -30,7 +30,13 @@ final class LogisterPayloadBudgetTests: XCTestCase {
         XCTAssertEqual((crashed["frames"] as? [[String: Any]])?.count, 30)
         XCTAssertEqual((exception["stacktrace"] as? [[String: Any]])?.count, 30)
         XCTAssertEqual(exception["code"] as? Double, 0)
+        XCTAssertFalse(isJSONBoolean(exception["code"]))
+        XCTAssertEqual(exception["type"] as? String, "1.0")
         XCTAssertEqual(exception["signal"] as? Double, 11)
+        let firstFrame = try XCTUnwrap((crashed["frames"] as? [[String: Any]])?.first)
+        XCTAssertEqual(firstFrame["sample_count"] as? Double, 1)
+        XCTAssertFalse(isJSONBoolean(firstFrame["sample_count"]))
+        XCTAssertTrue(isJSONBoolean(firstFrame["application_frame"]))
         XCTAssertEqual((context["diagnostic"] as? [String: Any])?["signature"] as? String,
                        "metrickit:crash:AAAAAAAA-BBBB-CCCC-DDDD-000000000007:0x1000")
         XCTAssertEqual((context["os"] as? [String: Any])?["version"] as? String, "iPhone OS 17.4 (21E219)")
@@ -195,6 +201,11 @@ func crashDiagnosticFixture(threads: Int, framesPerThread: Int, attributedThread
             ]
         ]
     ]
+}
+
+func isJSONBoolean(_ value: Any?) -> Bool {
+    guard let value = value as? NSNumber else { return false }
+    return CFGetTypeID(value) == CFBooleanGetTypeID()
 }
 
 /// Mirrors `TelemetryPayloadLimits` in the Logister server, which answers 413
