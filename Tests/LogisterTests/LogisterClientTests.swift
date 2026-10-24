@@ -138,8 +138,9 @@ final class LogisterClientTests: XCTestCase {
     }
 
     func testCaptureExceptionEnvelope() async throws {
-        enum SampleError: Error {
-            case failed
+        enum SampleError: Error, LocalizedError {
+            case failed(password: String)
+            var errorDescription: String? { "Checkout failed" }
         }
 
         let transport = CapturingTransport()
@@ -148,11 +149,12 @@ final class LogisterClientTests: XCTestCase {
             tokenProvider: SequenceTokenProvider(tokens: [
                 LogisterToken(token: "mobile-token-1", expiresAt: Date().addingTimeInterval(300))
             ]),
+            exceptionDataPolicy: .full,
             configuration: testConfiguration(),
             transport: transport
         )
 
-        try await client.captureException(SampleError.failed)
+        try await client.captureException(SampleError.failed(password: "associated-secret"))
 
         let event = try XCTUnwrap(transport.envelope()["event"] as? [String: Any])
         let context = try XCTUnwrap(event["context"] as? [String: Any])
@@ -165,7 +167,9 @@ final class LogisterClientTests: XCTestCase {
         XCTAssertEqual(event["event_type"] as? String, "error")
         XCTAssertEqual(event["level"] as? String, "error")
         XCTAssertNotNil(exception["type"] as? String)
-        XCTAssertEqual(exception["message"] as? String, "failed")
+        XCTAssertEqual(exception["message"] as? String, "Checkout failed")
+        XCTAssertEqual(event["message"] as? String, "Checkout failed")
+        XCTAssertFalse(String(decoding: try XCTUnwrap(transport.body), as: UTF8.self).contains("associated-secret"))
         XCTAssertFalse(stacktrace.isEmpty)
         XCTAssertNotNil(stacktrace.first?["raw"] as? String)
         XCTAssertEqual(errorContext["mechanism"] as? String, "handled_exception")
@@ -178,6 +182,73 @@ final class LogisterClientTests: XCTestCase {
         XCTAssertEqual(threads.first?["triggered"] as? Bool, false)
         XCTAssertEqual(threads.first?["role"] as? String, "reporting")
         XCTAssertEqual(errorContext["thread_role"] as? String, "reporting")
+    }
+
+    func testFullExceptionPolicySendsOnlyReviewedUserInfo() async throws {
+        let transport = CapturingTransport()
+        let client = LogisterClient(
+            endpoint: URL(string: "https://logister.example/api/v1/ingest_events")!,
+            tokenProvider: SequenceTokenProvider(tokens: [
+                LogisterToken(token: "mobile-token-1", expiresAt: Date().addingTimeInterval(300))
+            ]),
+            exceptionDataPolicy: .full,
+            configuration: testConfiguration(),
+            transport: transport
+        )
+        let root = NSError(domain: NSPOSIXErrorDomain, code: 13, userInfo: [NSFilePathErrorKey: "/Users/jane/private.txt"])
+        let underlying = NSError(domain: NSURLErrorDomain, code: -1_001, userInfo: [NSUnderlyingErrorKey: root])
+
+        try await client.captureException(
+            NSError(
+                domain: "Checkout",
+                code: 7,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Payment declined",
+                    NSLocalizedFailureReasonErrorKey: "Card expired",
+                    NSURLErrorFailingURLErrorKey: URL(string: "https://pay.example/charge?card=4111")!,
+                    NSDebugDescriptionErrorKey: "debug detail",
+                    NSUnderlyingErrorKey: underlying,
+                    "customerEmail": "jane@example.com"
+                ]
+            )
+        )
+
+        let serialized = String(decoding: try XCTUnwrap(transport.body), as: UTF8.self)
+        let event = try XCTUnwrap(transport.envelope()["event"] as? [String: Any])
+        let exception = try XCTUnwrap((event["context"] as? [String: Any])?["exception"] as? [String: Any])
+        let userInfo = try XCTUnwrap(exception["user_info"] as? [String: Any])
+        XCTAssertEqual(exception["message"] as? String, "Payment declined")
+        XCTAssertEqual(exception["domain"] as? String, "Checkout")
+        XCTAssertEqual(exception["code"] as? Double, 7)
+        XCTAssertEqual(userInfo["failure_reason"] as? String, "Card expired")
+        XCTAssertEqual(userInfo["failing_url"] as? String, "https://pay.example/charge")
+        let cause = try XCTUnwrap(userInfo["underlying"] as? [String: Any])
+        XCTAssertEqual(cause["domain"] as? String, NSURLErrorDomain)
+        XCTAssertEqual(cause["code"] as? Double, -1_001)
+        XCTAssertEqual((cause["underlying"] as? [String: Any])?["code"] as? Double, 13)
+        for omitted in ["jane@example.com", "debug detail", "/Users/jane", "4111"] {
+            XCTAssertFalse(serialized.contains(omitted), omitted)
+        }
+    }
+
+    func testInitializersWithoutAnExplicitPolicyUseTheSafeExceptionPolicy() async throws {
+        let transport = CapturingTransport()
+        let client = LogisterClient(
+            endpoint: URL(string: "https://logister.example/api/v1/ingest_events")!,
+            tokenProvider: SequenceTokenProvider(tokens: [
+                LogisterToken(token: "mobile-token-1", expiresAt: Date().addingTimeInterval(300))
+            ]),
+            configuration: testConfiguration(),
+            transport: transport
+        )
+
+        try await client.captureException(NSError(domain: "private.domain", code: 1, userInfo: [NSLocalizedDescriptionKey: "private text"]))
+
+        let event = try XCTUnwrap(transport.envelope()["event"] as? [String: Any])
+        let context = try XCTUnwrap(event["context"] as? [String: Any])
+        XCTAssertEqual((context["error"] as? [String: Any])?["data_policy"] as? String, "type_and_stacktrace")
+        XCTAssertNil((context["exception"] as? [String: Any])?["message"])
+        XCTAssertFalse(String(decoding: try XCTUnwrap(transport.body), as: UTF8.self).contains("private"))
     }
 
     func testSafeExceptionPolicyOmitsRawErrorTextAndMetadata() async throws {

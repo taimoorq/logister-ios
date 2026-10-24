@@ -220,6 +220,8 @@ public struct LogisterClient: Sendable {
             defaultContext: defaultContext,
             tokenRefreshSkew: tokenRefreshSkew,
             retryPolicy: retryPolicy,
+            exceptionDataPolicy: .typeAndStacktrace,
+            platformContextPolicy: .standard,
             configuration: .default,
             transport: transport
         )
@@ -286,6 +288,8 @@ public struct LogisterClient: Sendable {
             defaultContext: defaultContext,
             tokenRefreshSkew: tokenRefreshSkew,
             retryPolicy: retryPolicy,
+            exceptionDataPolicy: .typeAndStacktrace,
+            platformContextPolicy: .standard,
             configuration: .default,
             transport: transport
         )
@@ -326,6 +330,7 @@ public struct LogisterClient: Sendable {
         )
     }
 
+    /// Uses the `typeAndStacktrace` exception policy and the standard platform policy.
     @available(*, deprecated, message: "Choose an explicit exceptionDataPolicy and platformContextPolicy.")
     public init(
         baseURL: URL,
@@ -354,7 +359,7 @@ public struct LogisterClient: Sendable {
             defaultContext: defaultContext,
             tokenRefreshSkew: tokenRefreshSkew,
             retryPolicy: retryPolicy,
-            exceptionDataPolicy: .full,
+            exceptionDataPolicy: .typeAndStacktrace,
             platformContextPolicy: .standard,
             configuration: configuration,
             transport: transport
@@ -397,6 +402,7 @@ public struct LogisterClient: Sendable {
         )
     }
 
+    /// Uses the `typeAndStacktrace` exception policy and the standard platform policy.
     @available(*, deprecated, message: "Choose an explicit exceptionDataPolicy and platformContextPolicy.")
     public init(
         endpoint: URL,
@@ -425,7 +431,7 @@ public struct LogisterClient: Sendable {
             defaultContext: defaultContext,
             tokenRefreshSkew: tokenRefreshSkew,
             retryPolicy: retryPolicy,
-            exceptionDataPolicy: .full,
+            exceptionDataPolicy: .typeAndStacktrace,
             platformContextPolicy: .standard,
             configuration: configuration,
             transport: transport
@@ -570,9 +576,11 @@ public struct LogisterClient: Sendable {
         ]
         if exceptionDataPolicy == .full {
             let bridgedError = error as NSError
-            exception["message"] = .string(String(describing: error))
+            exception["message"] = .string(error.localizedDescription)
             exception["domain"] = .string(bridgedError.domain)
             exception["code"] = .number(Double(bridgedError.code))
+            let userInfo = Self.reviewedUserInfo(bridgedError)
+            if !userInfo.isEmpty { exception["user_info"] = .object(userInfo) }
         }
         context["exception"] = .object(exception)
         context["diagnostic"] = .object([
@@ -598,12 +606,40 @@ public struct LogisterClient: Sendable {
             LogisterEvent(
                 eventType: "error",
                 message: exceptionDataPolicy == .full
-                    ? String(describing: error)
+                    ? error.localizedDescription
                     : String(reflecting: Swift.type(of: error)),
                 level: options.level ?? "error"
             ),
             options: eventOptions
         )
+    }
+
+    /// The `.full` policy sends only these `userInfo` entries. Arbitrary keys,
+    /// file paths and debug descriptions often hold customer data.
+    private static func reviewedUserInfo(_ error: NSError, depth: Int = 0) -> LogisterContext {
+        var result: LogisterContext = [:]
+        func put(_ value: Any?, as key: String) {
+            let string: String?
+            switch value {
+            case let url as URL: string = url.absoluteString
+            case let text as String: string = text
+            default: string = nil
+            }
+            if let string, !string.isEmpty { result[key] = .string(String(string.prefix(512))) }
+        }
+        put(error.userInfo[NSLocalizedFailureReasonErrorKey], as: "failure_reason")
+        put(error.userInfo[NSLocalizedRecoverySuggestionErrorKey], as: "recovery_suggestion")
+        put(error.userInfo[NSURLErrorFailingURLErrorKey] ?? error.userInfo[NSURLErrorFailingURLStringErrorKey], as: "failing_url")
+        if depth < 3, let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+            var cause: LogisterContext = [
+                "domain": .string(underlying.domain),
+                "code": .number(Double(underlying.code))
+            ]
+            let nested = reviewedUserInfo(underlying, depth: depth + 1)
+            if case .object(let next)? = nested["underlying"] { cause["underlying"] = .object(next) }
+            result["underlying"] = .object(cause)
+        }
+        return result
     }
 
     @discardableResult
