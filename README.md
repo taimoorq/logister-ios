@@ -16,7 +16,8 @@ Apple app → Logister ingest endpoint with the short-lived token
 ## What it supports
 
 - Swift Package Manager library product named `Logister`.
-- Async/await client backed by `URLSession`.
+- Async/await client backed by a dedicated `URLSession` with bounded timeouts,
+  no cookies or cache, no redirects, and https-only endpoints.
 - Injectable transport for tests or alternate networking stacks.
 - Async token-provider based authentication with short-lived mobile ingest tokens.
 - Typed JSON context values for safe event metadata.
@@ -35,16 +36,21 @@ Apple app → Logister ingest endpoint with the short-lived token
   idempotent. Resource and launch diagnostics do not invent fatality.
 - Actor-owned durable, bounded, process-local delivery scoped by endpoint,
   application/service, and optional client scope; tokens are never persisted.
-- Bounded transient retries for timeouts, rate limits, and server errors, with
-  `Retry-After`, one-time `401` refresh, and poison-response discard.
+- Bounded, jittered transient retries for timeouts, rate limits, and server
+  errors, with `Retry-After`, one-time `401` refresh, and poison-response
+  discard.
 - Runtime collection disable/purge, an opt-in rotating delivery-installation
-  pseudonym, recursive credential/URL redaction, payload budgets, a final
-  `beforeSend` hook, and a non-sensitive health snapshot.
+  pseudonym, the shared Logister redaction rule, payload budgets that match the
+  server's limits, a final `beforeSend` hook, and a non-sensitive health
+  snapshot.
 
 `captureException` is a handled report; it is not an automatic fatal-crash
-handler. Set its policy to `typeAndStacktrace` when error text has not received a
-privacy review. MetricKit is the opt-in source for OS-delivered diagnostics and
-uses that safe policy by default. Automatic screen timing and URLSession timing
+handler. The default `typeAndStacktrace` policy sends the error type and stack
+only. `.full` adds the error's `localizedDescription`, NSError domain and code,
+and a reviewed `userInfo` subset (failure reason, recovery suggestion, failing
+URL without its query, and underlying error domains and codes); choose it only
+after reviewing that text. MetricKit is the opt-in source for OS-delivered
+diagnostics and uses the safe policy by default. Automatic screen timing and URLSession timing
 are not included in the current package.
 
 ## Install
@@ -53,7 +59,7 @@ Add the public Swift package with Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.6.1")
+    .package(url: "https://github.com/taimoorq/logister-ios.git", from: "0.7.0")
 ]
 ```
 
@@ -64,7 +70,7 @@ Then depend on the library product:
 ```
 
 - Swift Package Manager URL: https://github.com/taimoorq/logister-ios.git
-- Release version: https://github.com/taimoorq/logister-ios/releases/tag/v0.6.1
+- Release version: https://github.com/taimoorq/logister-ios/releases/tag/v0.7.0
 - iOS integration docs: https://logister.org/docs/integrations/ios/
 
 ## Quick start
@@ -211,11 +217,52 @@ subscription, decoder, and installation-capability state.
 
 The optional installation pseudonym is random, endpoint/project/process scoped,
 rotated, and labeled `delivery_installation`; it is not IDFA, IDFV, or a
-historical MetricKit source session. `LogisterPayloadPolicy` bounds depth, item
-count, strings, and envelope bytes and removes common credential keys, Bearer
-values, URL query data, IDFA/IDFV, and hardware identifiers. The final
-`beforeSend` result is sanitized again and cannot replace UUID, occurrence-time
-precision, or evidence provenance.
+historical MetricKit source session. The final `beforeSend` result is
+sanitized again and cannot replace UUID, occurrence-time precision, or evidence
+provenance.
+
+### Redaction and payload limits
+
+Every event passes through the shared Logister redaction rule before it is
+queued, including context, breadcrumbs and their data, span and HTTP fields,
+exception data, MetricKit evidence, and anything `beforeSend` adds.
+
+- A key is sensitive when, after lowercasing and removing every
+  non-alphanumeric character, it equals one of
+  `LogisterPayloadPolicy.defaultSensitiveKeys` (`password`, `passwd`, `pwd`,
+  `secret`, `token`, `apikey`, `authorization`, `proxyauthorization`, `cookie`,
+  `setcookie`, `sessiontoken`, `sessionkey`, `credential`, `credentials`,
+  `privatekey`, `clientsecret`, `accesstoken`, `refreshtoken`, `idtoken`,
+  `authtoken`, `xapikey`, `xauthtoken`, `xaccesstoken`, `xcsrftoken`,
+  `xxsrftoken`, `signature`, `ssn`, `creditcard`, `cardnumber`, `cvv`), or
+  contains `token`, `secret`, `password`, `passwd`, `apikey`, `authorization`,
+  `credential` or `cookie`. So `accessToken`, `x-api-key` and `Set-Cookie` all
+  match. The value becomes `"[REDACTED]"`.
+- Strings are scrubbed for `Bearer <token>` and `Basic <credentials>`, JWTs,
+  and `lgst_` keys. URLs inside strings keep scheme, host and path; userinfo,
+  query and fragment are removed.
+- IDFA, IDFV, serial numbers and common hardware-identifier keys are removed.
+- The SDK's own envelope fields (`uuid`, `event_type`, `occurred_at`,
+  `trace_id`, `request_id`, `session_id`) are never redacted.
+
+Add your own keys by extending the default list. Entries are normalized the
+same way and must match exactly:
+
+```swift
+let configuration = LogisterConfiguration(
+    payloadPolicy: LogisterPayloadPolicy(
+        sensitiveKeys: LogisterPayloadPolicy.defaultSensitiveKeys.union(["pin_code", "account-number"])
+    )
+)
+```
+
+`LogisterPayloadPolicy` also bounds depth, items, string length, total object
+keys (`maximumKeys`, 512) and bytes (`maximumEnvelopeBytes`, 1,000,000). The key
+and byte defaults match the Logister server, which rejects larger events. When a
+budget runs out, the SDK keeps every envelope field and its own platform and
+error context, keeps small objects before large ones and the newest
+breadcrumbs, drops the rest, and sets `context._truncated` to `true`. An event
+that is still too large is shrunk further rather than dropped.
 
 ## MetricKit diagnostics
 
@@ -252,9 +299,11 @@ a real-time crash callback. The collector uploads each crash, hang,
 excessive-CPU, excessive-disk-write, and iOS 16+ slow-launch diagnostic through the normal short-lived-token
 path and uses a deterministic event UUID so a repeated payload does not create
 another Logister occurrence. Safe mode sends normalized exception type, codes,
-signals, privacy-filtered immutable source evidence, bounded frames, sampled
-call trees, and typed measurements without
-termination or exception reason text. The collector carries the payload's
+signals, source metadata and reporting interval, bounded frames, sampled call
+trees for hang and resource diagnostics, and typed measurements without
+termination or exception reason text. Crash threads are sent once as flattened
+frames with the crashed thread first, so a large crash keeps its crashed thread
+when the payload budget trims other threads. The collector carries the payload's
 reporting interval and source app version/build, hardware identifier, OS build,
 architecture, and TestFlight flag; it never substitutes uploader-time app,
 device, release, or occurrence facts. Use `.full` only after reviewing those
@@ -302,8 +351,27 @@ identity. It does not, by itself, mean existing events have been symbolicated.
 
 ## Delivery behavior
 
+The default transport sends on its own ephemeral `URLSession` with a 15 second
+request timeout and a 60 second resource timeout. It stores no cookies or
+cache and does not follow redirects, so the bearer token only reaches the
+configured endpoint; point the client at the final URL. The endpoint must use
+https. Plain http is accepted only for `localhost`, `*.localhost`, `127.x.x.x`
+and `::1`, or when you opt in for a development server:
+
+```swift
+var configuration = LogisterConfiguration()
+configuration.allowsInsecureTransport = true // local development only
+```
+
+Without it, capture against an http endpoint returns a `.dropped` response and
+nothing is queued.
+
+`LogisterTokenProvider.fetchToken()` gets `tokenProviderTimeout` seconds (30 by
+default) before the attempt fails and the event stays queued.
+
 The default retry policy makes at most three attempts for network failures,
-HTTP 408/425/429, and 5xx responses. It honors `Retry-After` up to the configured
+HTTP 408/425/429, and 5xx responses. Computed delays are jittered between half
+and all of the exponential backoff. It honors `Retry-After` up to the configured
 maximum delay. Disable it or tune the bounds explicitly:
 
 ```swift
@@ -318,9 +386,16 @@ let client = LogisterClient(
 )
 ```
 
-A permanent non-2xx response remains non-accepted and is removed so it cannot
-block later envelopes. An exhausted transient or authentication failure remains
-durably queued. The package never reports queued delivery as server acceptance.
+On a `401` the SDK fetches a new token once and resends. If the server still
+answers `401`, or the token provider fails or times out, the event stays queued
+with backoff until it is delivered, expires (`maximumQueueAge`) or is evicted by
+the queue bounds. Any other permanent non-2xx response, including `403`,
+remains non-accepted and is removed so it cannot block later envelopes. An
+exhausted transient failure also remains durably queued. The package never
+reports queued delivery as server acceptance.
+
+Each queued event is its own file, so an enqueue, delivery or retry writes only
+that event.
 
 ## Privacy manifest
 
@@ -361,7 +436,8 @@ try await client.checkIn(
 
 ## Development
 
-The package currently has envelope-focused tests:
+The tests cover envelopes, payload budgets against the server's limits,
+redaction, delivery, and request correlation:
 
 ```bash
 swift test
@@ -395,6 +471,29 @@ Swift Package Manager distribution from a public GitHub repository does not requ
 
 For server-side token issuance and mobile deployment guidance, read the [iOS integration guide](https://logister.org/docs/integrations/ios/) and the main app's [mobile add-ons reference](https://github.com/taimoorq/logister/blob/main/docs/mobile-add-ons.md).
 
+
+### Upgrading to 0.7.0
+
+0.7.0 has no source-breaking API changes, but several defaults change:
+
+- Initializers that do not pass `exceptionDataPolicy`, including the deprecated
+  ones, now use `.typeAndStacktrace`. Pass `.full` explicitly to keep error
+  messages, and note that `.full` now sends `localizedDescription` and a
+  reviewed `userInfo` subset instead of `String(describing:)`.
+- Sensitive values are replaced with `"[REDACTED]"` instead of removing the key,
+  and many more keys match (see "Redaction and payload limits").
+- Events are held to 512 object keys and 1,000,000 bytes. Large contexts and
+  long breadcrumb lists are trimmed and marked with `context._truncated`
+  instead of the whole event being rejected.
+- http endpoints are refused unless the host is loopback or
+  `allowsInsecureTransport` is set. Redirects are no longer followed.
+- A repeated `401` keeps the event queued instead of discarding it.
+- The queue moves from `delivery-<scope>.json` to a `delivery-<scope>/`
+  directory with one file per event. Existing queued events are migrated on
+  first launch.
+- MetricKit crash events no longer include `diagnostic.call_stack_tree` (it
+  repeated the thread frames) or `source_evidence.diagnostic` (the raw payload).
+  With `.full`, the raw payload is still sent as `context.metrickit`.
 
 ### Migrating from 0.3 to 0.5
 

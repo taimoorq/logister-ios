@@ -57,6 +57,7 @@ private struct QueuedEnvelope: Codable, Sendable {
     var priority: Int
 }
 
+/// The single-file queue format written before 0.7.0; read once and migrated.
 private struct PersistedQueue: Codable, Sendable {
     var schemaVersion: Int
     var entries: [QueuedEnvelope]
@@ -71,7 +72,10 @@ actor LogisterRuntime {
     typealias Sender = @Sendable (Data) async throws -> LogisterResponse
 
     private let configuration: LogisterConfiguration
-    private let queueURL: URL
+    /// One file per envelope, so an enqueue, delivery or retry writes only the
+    /// entry it changes instead of rewriting the whole queue.
+    private let queueDirectory: URL
+    private let legacyQueueURL: URL
     private let installationURL: URL
     private var collectionEnabled: Bool
     private var queue: [QueuedEnvelope]
@@ -87,9 +91,14 @@ actor LogisterRuntime {
         self.collectionEnabled = configuration.collectionEnabled
         let directory = configuration.storageDirectory ?? Self.defaultStorageDirectory()
         let scope = Self.storageScope(endpoint: endpoint, service: service, explicit: configuration.storageScope)
-        self.queueURL = directory.appendingPathComponent("delivery-\(scope).json", isDirectory: false)
+        self.queueDirectory = directory.appendingPathComponent("delivery-\(scope)", isDirectory: true)
+        self.legacyQueueURL = directory.appendingPathComponent("delivery-\(scope).json", isDirectory: false)
         self.installationURL = directory.appendingPathComponent("installation-\(scope).json", isDirectory: false)
-        self.queue = Self.loadQueue(from: queueURL, configuration: configuration)
+        self.queue = Self.loadQueue(
+            from: queueDirectory,
+            legacyURL: legacyQueueURL,
+            configuration: configuration
+        )
         self.installation = Self.loadInstallation(from: installationURL)
         Self.excludeFromBackup(directory)
     }
@@ -129,18 +138,18 @@ actor LogisterRuntime {
         }
         pruneExpired(now: capturedAt)
         if !queue.contains(where: { $0.id == id }) {
-            queue.append(
-                QueuedEnvelope(
-                    id: id,
-                    capturedAt: capturedAt,
-                    body: body,
-                    attemptCount: 0,
-                    nextAttemptAt: nil,
-                    priority: priority
-                )
+            let entry = QueuedEnvelope(
+                id: id,
+                capturedAt: capturedAt,
+                body: body,
+                attemptCount: 0,
+                nextAttemptAt: nil,
+                priority: priority
             )
+            queue.append(entry)
             enforceQueueBounds()
-            guard queue.contains(where: { $0.id == id }), persistQueue() else {
+            guard queue.contains(where: { $0.id == id }), persist(entry) else {
+                queue.removeAll { $0.id == id }
                 discardedEventCount += 1
                 lastError = "durable queue write failed"
                 return .dropped("durable queue write failed")
@@ -151,8 +160,8 @@ actor LogisterRuntime {
 
     func flush(retryPolicy: LogisterRetryPolicy, force: Bool, sender: Sender) async -> Int {
         if force {
+            // Backoff state is advisory, so this is not written to disk.
             for index in queue.indices { queue[index].nextAttemptAt = nil }
-            _ = persistQueue()
         }
         return await drain(targetID: nil, retryPolicy: retryPolicy, sender: sender).acceptedCount
     }
@@ -162,7 +171,8 @@ actor LogisterRuntime {
         guard !enabled, purgeOnDisable else { return }
         queue.removeAll()
         installation = nil
-        _ = try? FileManager.default.removeItem(at: queueURL)
+        _ = try? FileManager.default.removeItem(at: queueDirectory)
+        _ = try? FileManager.default.removeItem(at: legacyQueueURL)
         _ = try? FileManager.default.removeItem(at: installationURL)
     }
 
@@ -211,21 +221,23 @@ actor LogisterRuntime {
                 guard let index = queue.firstIndex(where: { $0.id == current.id }) else { continue }
                 if response.accepted {
                     queue.remove(at: index)
-                    _ = persistQueue()
+                    removePersisted(current.id)
                     acceptedCount += 1
                     lastDeliveryAt = Date()
                     lastError = nil
                     if current.id == targetID { targetResponse = response.withDeliveryState(.accepted) }
                     continue
                 }
-                if retryPolicy.shouldRetry(statusCode: response.statusCode) {
+                // A 401 has already had one token refresh; keep the envelope
+                // queued for a later token rather than discarding it.
+                if retryPolicy.shouldRetry(statusCode: response.statusCode) || response.statusCode == 401 {
                     scheduleRetry(at: index, policy: retryPolicy, response: response)
                     return (.queued(), acceptedCount)
                 }
                 queue.remove(at: index)
                 discardedEventCount += 1
                 lastError = "permanent HTTP \(response.statusCode)"
-                _ = persistQueue()
+                removePersisted(current.id)
                 if current.id == targetID { targetResponse = response.withDeliveryState(.rejected) }
             } catch is CancellationError {
                 if let index = queue.firstIndex(where: { $0.id == current.id }) {
@@ -248,14 +260,15 @@ actor LogisterRuntime {
         let delay = min(max(policy.delay(after: queue[index].attemptCount, response: response), 1), 86_400)
         queue[index].nextAttemptAt = Date().addingTimeInterval(delay)
         lastError = response.map { "HTTP \($0.statusCode)" } ?? lastError ?? "delivery retry scheduled"
-        _ = persistQueue()
+        persist(queue[index])
     }
 
     private func pruneExpired(now: Date) {
         let cutoff = now.addingTimeInterval(-configuration.maximumQueueAge)
-        let before = queue.count
+        let expired = queue.filter { $0.capturedAt < cutoff }
         queue.removeAll { $0.capturedAt < cutoff }
-        discardedEventCount += before - queue.count
+        expired.forEach { removePersisted($0.id) }
+        discardedEventCount += expired.count
     }
 
     private func enforceQueueBounds() {
@@ -263,27 +276,34 @@ actor LogisterRuntime {
             guard !queue.isEmpty else { break }
             let lowestPriority = queue.map(\.priority).min() ?? 0
             let evictionIndex = queue.firstIndex(where: { $0.priority == lowestPriority }) ?? queue.startIndex
-            queue.remove(at: evictionIndex)
+            removePersisted(queue.remove(at: evictionIndex).id)
             discardedEventCount += 1
         }
     }
 
     @discardableResult
-    private func persistQueue() -> Bool {
+    private func persist(_ entry: QueuedEnvelope) -> Bool {
         do {
-            try FileManager.default.createDirectory(at: queueURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if queue.isEmpty {
-                if FileManager.default.fileExists(atPath: queueURL.path) { try FileManager.default.removeItem(at: queueURL) }
-                return true
+            if !FileManager.default.fileExists(atPath: queueDirectory.path) {
+                try FileManager.default.createDirectory(at: queueDirectory, withIntermediateDirectories: true)
+                Self.excludeFromBackup(queueDirectory)
             }
-            let data = try JSONEncoder().encode(PersistedQueue(schemaVersion: 1, entries: queue))
-            try data.write(to: queueURL, options: [.atomic])
-            Self.excludeFromBackup(queueURL)
+            let url = Self.entryURL(entry.id, in: queueDirectory)
+            try JSONEncoder().encode(entry).write(to: url, options: [.atomic])
+            Self.excludeFromBackup(url)
             return true
         } catch {
             lastError = "queue persistence failed"
             return false
         }
+    }
+
+    private func removePersisted(_ id: UUID) {
+        try? FileManager.default.removeItem(at: Self.entryURL(id, in: queueDirectory))
+    }
+
+    private static func entryURL(_ id: UUID, in directory: URL) -> URL {
+        directory.appendingPathComponent("\(id.uuidString.lowercased()).json", isDirectory: false)
     }
 
     private func persistInstallation() {
@@ -318,17 +338,44 @@ actor LogisterRuntime {
         SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func loadQueue(from url: URL, configuration: LogisterConfiguration) -> [QueuedEnvelope] {
-        guard let data = try? Data(contentsOf: url) else { return [] }
-        do {
-            let persisted = try JSONDecoder().decode(PersistedQueue.self, from: data)
-            let cutoff = Date().addingTimeInterval(-configuration.maximumQueueAge)
-            return persisted.entries.filter { $0.capturedAt >= cutoff }
-        } catch {
-            let quarantine = url.appendingPathExtension("corrupt")
-            try? FileManager.default.removeItem(at: quarantine)
-            try? FileManager.default.moveItem(at: url, to: quarantine)
-            return []
+    private static func loadQueue(
+        from directory: URL,
+        legacyURL: URL,
+        configuration: LogisterConfiguration
+    ) -> [QueuedEnvelope] {
+        let cutoff = Date().addingTimeInterval(-configuration.maximumQueueAge)
+        var entries: [UUID: QueuedEnvelope] = [:]
+        let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        for file in files where file.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: file),
+                  let entry = try? JSONDecoder().decode(QueuedEnvelope.self, from: data),
+                  entry.capturedAt >= cutoff else {
+                try? FileManager.default.removeItem(at: file)
+                continue
+            }
+            entries[entry.id] = entry
+        }
+
+        if let data = try? Data(contentsOf: legacyURL) {
+            if let persisted = try? JSONDecoder().decode(PersistedQueue.self, from: data) {
+                let migrated = persisted.entries.filter { $0.capturedAt >= cutoff && entries[$0.id] == nil }
+                try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                excludeFromBackup(directory)
+                for entry in migrated {
+                    let url = entryURL(entry.id, in: directory)
+                    guard (try? JSONEncoder().encode(entry).write(to: url, options: [.atomic])) != nil else { continue }
+                    excludeFromBackup(url)
+                    entries[entry.id] = entry
+                }
+                try? FileManager.default.removeItem(at: legacyURL)
+            } else {
+                let quarantine = legacyURL.appendingPathExtension("corrupt")
+                try? FileManager.default.removeItem(at: quarantine)
+                try? FileManager.default.moveItem(at: legacyURL, to: quarantine)
+            }
+        }
+        return entries.values.sorted {
+            $0.capturedAt == $1.capturedAt ? $0.id.uuidString < $1.id.uuidString : $0.capturedAt < $1.capturedAt
         }
     }
 

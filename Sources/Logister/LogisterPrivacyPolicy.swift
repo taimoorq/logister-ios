@@ -6,8 +6,10 @@ public enum LogisterExceptionDataPolicy: String, Equatable, Sendable {
     /// causes, NSError domains, or NSError codes.
     case typeAndStacktrace = "type_and_stacktrace"
 
-    /// Preserves the 0.2.x manual-capture behavior for applications that have
-    /// explicitly reviewed raw error text and NSError metadata.
+    /// Adds the error's `localizedDescription`, NSError domain and code, and
+    /// a bounded reviewed `userInfo` subset (failure reason, recovery
+    /// suggestion, failing URL without its query, and underlying domains and
+    /// codes). Use it only after reviewing that text for the app's data policy.
     case full
 }
 
