@@ -67,7 +67,11 @@ public struct LogisterRetryPolicy: Equatable, Sendable {
                 return min(max(0, date.timeIntervalSinceNow), maximumDelay)
             }
         }
-        return min(baseDelay * pow(2, Double(max(0, attempt - 1))), maximumDelay)
+        // Equal jitter keeps half the backoff and spreads the rest, so clients
+        // that failed together do not retry together.
+        let backoff = min(baseDelay * pow(2, Double(max(0, attempt - 1))), maximumDelay)
+        guard backoff > 0 else { return 0 }
+        return backoff / 2 + Double.random(in: 0...(backoff / 2))
     }
 }
 
@@ -85,14 +89,32 @@ public protocol LogisterTransport: Sendable {
     func send(request: URLRequest, body: Data) async throws -> LogisterResponse
 }
 
+/// Sends envelopes on a dedicated ephemeral session with bounded timeouts. It
+/// stores no cookies or cache and never follows a redirect, so the bearer
+/// token is only ever sent to the configured endpoint.
 public struct URLSessionLogisterTransport: LogisterTransport {
+    static let requestTimeout: TimeInterval = 15
+    static let resourceTimeout: TimeInterval = 60
+
+    static let session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = requestTimeout
+        configuration.timeoutIntervalForResource = resourceTimeout
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration, delegate: LogisterRedirectRefusal(), delegateQueue: nil)
+    }()
+
     public init() {
     }
 
     public func send(request: URLRequest, body: Data) async throws -> LogisterResponse {
         var request = request
         request.httpBody = body
-        let (data, response) = try await URLSession.shared.data(for: request)
+        request.timeoutInterval = Self.requestTimeout
+        let (data, response) = try await Self.session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw LogisterError.invalidResponse
         }
@@ -100,6 +122,13 @@ public struct URLSessionLogisterTransport: LogisterTransport {
             result[String(describing: entry.key)] = String(describing: entry.value)
         }
         return LogisterResponse(statusCode: httpResponse.statusCode, body: data, headers: headers)
+    }
+}
+
+final class LogisterRedirectRefusal: NSObject, URLSessionTaskDelegate, Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+        completionHandler(nil)
     }
 }
 
@@ -125,15 +154,19 @@ public protocol LogisterTokenProvider: Sendable {
     func fetchToken() async throws -> LogisterToken
 }
 
-private actor LogisterTokenStore {
+struct LogisterTokenProviderTimeout: Error {}
+
+actor LogisterTokenStore {
     private let provider: any LogisterTokenProvider
     private let refreshSkew: TimeInterval
+    private let timeout: TimeInterval
     private var cachedToken: LogisterToken?
     private var refreshTask: Task<LogisterToken, Error>?
 
-    init(provider: any LogisterTokenProvider, refreshSkew: TimeInterval) {
+    init(provider: any LogisterTokenProvider, refreshSkew: TimeInterval, timeout: TimeInterval) {
         self.provider = provider
         self.refreshSkew = refreshSkew
+        self.timeout = timeout
     }
 
     func mobileIngestToken() async throws -> String {
@@ -146,17 +179,19 @@ private actor LogisterTokenStore {
         if let refreshTask {
             task = refreshTask
         } else {
-            task = Task { try await provider.fetchToken() }
+            let provider = provider
+            let timeout = timeout
+            task = Task { try await Self.fetch(from: provider, timeout: timeout) }
             refreshTask = task
         }
         let fresh: LogisterToken
         do {
             fresh = try await task.value
         } catch {
-            refreshTask = nil
+            if refreshTask == task { refreshTask = nil }
             throw error
         }
-        refreshTask = nil
+        if refreshTask == task { refreshTask = nil }
         guard !fresh.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw LogisterError.invalidMobileIngestToken
         }
@@ -168,10 +203,60 @@ private actor LogisterTokenStore {
         return fresh.token
     }
 
+    /// Forgets the cached token. A refresh already in flight is shared by
+    /// other callers, so it is left to finish rather than cancelled.
     func invalidate() {
         cachedToken = nil
-        refreshTask?.cancel()
-        refreshTask = nil
+    }
+
+    /// Returns the provider's token, or throws once `timeout` passes even if
+    /// the provider ignores cancellation.
+    private static func fetch(from provider: any LogisterTokenProvider, timeout: TimeInterval) async throws -> LogisterToken {
+        try await withCheckedThrowingContinuation { continuation in
+            let race = TokenFetchRace(continuation)
+            let timer = Task {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                race.finish(.failure(LogisterTokenProviderTimeout()))
+            }
+            race.start(Task {
+                do {
+                    race.finish(.success(try await provider.fetchToken()))
+                } catch {
+                    race.finish(.failure(error))
+                }
+                timer.cancel()
+            })
+        }
+    }
+}
+
+private final class TokenFetchRace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<LogisterToken, Error>?
+    private var work: Task<Void, Never>?
+
+    init(_ continuation: CheckedContinuation<LogisterToken, Error>) {
+        self.continuation = continuation
+    }
+
+    func start(_ work: Task<Void, Never>) {
+        lock.lock()
+        let finished = continuation == nil
+        if !finished { self.work = work }
+        lock.unlock()
+        if finished { work.cancel() }
+    }
+
+    func finish(_ result: Result<LogisterToken, Error>) {
+        lock.lock()
+        let continuation = continuation
+        let work = work
+        self.continuation = nil
+        self.work = nil
+        lock.unlock()
+        guard let continuation else { return }
+        continuation.resume(with: result)
+        if case .failure(let error) = result, error is LogisterTokenProviderTimeout { work?.cancel() }
     }
 }
 
@@ -192,6 +277,7 @@ public struct LogisterClient: Sendable {
     private let platformContextPolicy: LogisterPlatformContextPolicy
     private let configuration: LogisterConfiguration
     private let runtime: LogisterRuntime
+    private let endpointPermitted: Bool
 
     // Retain the initializer symbols exposed by the last public Swift package.
     public init(
@@ -468,12 +554,21 @@ public struct LogisterClient: Sendable {
         self.exceptionDataPolicy = exceptionDataPolicy
         self.platformContextPolicy = platformContextPolicy
         self.configuration = configuration
-        self.tokenStore = LogisterTokenStore(provider: tokenProvider, refreshSkew: tokenRefreshSkew)
+        self.tokenStore = LogisterTokenStore(
+            provider: tokenProvider,
+            refreshSkew: tokenRefreshSkew,
+            timeout: min(max(configuration.tokenProviderTimeout, 1), 120)
+        )
+        self.endpointPermitted = Self.permitsEndpoint(endpoint, allowInsecure: configuration.allowsInsecureTransport)
         self.runtime = LogisterRuntime(endpoint: endpoint, service: service, configuration: configuration)
     }
 
     @discardableResult
     public func capture(_ event: LogisterEvent, options: LogisterEventOptions = LogisterEventOptions()) async throws -> LogisterResponse {
+        guard endpointPermitted else {
+            await runtime.recordDiscard(reason: "endpoint must use https")
+            return .dropped("endpoint must use https")
+        }
         let eventID = event.eventID ?? UUID()
         let capturedAt = options.occurredAt ?? event.occurredAt ?? Date()
         let captureState = await runtime.captureState(now: capturedAt, category: collectionCategory(for: event))
@@ -513,7 +608,8 @@ public struct LogisterClient: Sendable {
     }
 
     public func flushQueuedEvents() async -> Int {
-        await runtime.flush(
+        guard endpointPermitted else { return 0 }
+        return await runtime.flush(
             retryPolicy: retryPolicy,
             force: true,
             sender: { body in try await send(body: body) }
@@ -526,6 +622,21 @@ public struct LogisterClient: Sendable {
 
     public func healthSnapshot() async -> LogisterClientHealth {
         await runtime.health()
+    }
+
+    /// Telemetry carries a bearer token, so plain http is accepted only for
+    /// loopback hosts or when `allowsInsecureTransport` is set.
+    static func permitsEndpoint(_ endpoint: URL, allowInsecure: Bool) -> Bool {
+        switch endpoint.scheme?.lowercased() {
+        case "https":
+            return true
+        case "http":
+            guard !allowInsecure else { return true }
+            let host = (endpoint.host ?? "").lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            return host == "localhost" || host.hasSuffix(".localhost") || host == "::1" || host.hasPrefix("127.")
+        default:
+            return false
+        }
     }
 
     func setMetricKitSubscribed(_ subscribed: Bool) async {

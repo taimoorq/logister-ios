@@ -90,6 +90,12 @@ public struct LogisterConfiguration: Sendable {
     public var installationRotationInterval: TimeInterval
     public var payloadPolicy: LogisterPayloadPolicy
     public var beforeSend: LogisterBeforeSend?
+    /// Seconds to wait for `LogisterTokenProvider.fetchToken()` before the
+    /// delivery attempt fails and the event stays queued. Clamped to 1...120.
+    public var tokenProviderTimeout: TimeInterval = 30
+    /// Permits a plain `http` endpoint on a non-loopback host. Use it only for
+    /// local development servers; the bearer token is sent in clear text.
+    public var allowsInsecureTransport = false
 
     public init(
         collectionEnabled: Bool = true,
