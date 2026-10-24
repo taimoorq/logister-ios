@@ -126,9 +126,14 @@ enum LogisterMetricKitAdapter {
             throw LogisterError.invalidPayload
         }
         let sourceRaw = sourcePayload.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-        let metadata = (sourceRaw?["metaData"] as? [String: Any])
+        // Apple nests exception facts and device metadata in `diagnosticMetaData`;
+        // top-level fields are still honored for older or hand-built payloads.
+        let diagnosticMetadata = raw["diagnosticMetaData"] as? [String: Any] ?? [:]
+        let fields = diagnosticMetadata.merging(raw) { _, topLevel in topLevel }
+        let payloadMetadata = (sourceRaw?["metaData"] as? [String: Any])
             ?? (sourceRaw?["metadata"] as? [String: Any])
             ?? [:]
+        let metadata = payloadMetadata.merging(diagnosticMetadata) { _, diagnostic in diagnostic }
 
         let callStackTree = normalizedCallStackTree(raw, kind: kind)
         let threads = normalizedThreads(raw, kind: kind)
@@ -140,7 +145,7 @@ enum LogisterMetricKitAdapter {
             guard case .object(let value) = thread, case .array(let frames) = value["frames"] else { return nil }
             return frames
         } ?? []
-        let signature = diagnosticSignature(kind: kind, threads: threads, raw: raw)
+        let signature = diagnosticSignature(kind: kind, threads: threads, raw: fields)
         let externalID = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         let missingUUIDs = applicationUUIDs(in: threads)
 
@@ -160,7 +165,7 @@ enum LogisterMetricKitAdapter {
         if let signature { diagnostic["signature"] = .string(signature) }
         diagnostic["binary_uuids"] = .array(missingUUIDs.map(LogisterValue.string))
         if let callStackTree { diagnostic["call_stack_tree"] = callStackTree }
-        let measurements = normalizedMeasurements(raw, kind: kind)
+        let measurements = normalizedMeasurements(fields, kind: kind)
         if !measurements.isEmpty { diagnostic["measurements"] = .object(measurements) }
 
         var error: LogisterContext = [
@@ -170,7 +175,7 @@ enum LogisterMetricKitAdapter {
         ]
         if kind == .crash { error["handled"] = .bool(false) }
         if let fatal = kind.fatal { error["fatal"] = .bool(fatal) }
-        if let userPerceived = raw["userPerceived"] as? Bool {
+        if let userPerceived = fields["userPerceived"] as? Bool {
             error["user_perceived"] = .bool(userPerceived)
         }
         error["thread_role"] = .string(primaryThreadRole(kind))
@@ -181,12 +186,12 @@ enum LogisterMetricKitAdapter {
         ]
         if kind == .crash {
             var exception: LogisterContext = [
-                "type": .string(exceptionType(raw, kind: kind)),
+                "type": .string(exceptionType(fields, kind: kind)),
                 "threads": .array(threads),
                 "stacktrace": .array(triggeredFrames)
             ]
-            put(raw["exceptionCode"], into: &exception, key: "code")
-            put(raw["signal"], into: &exception, key: "signal")
+            put(fields["exceptionCode"], into: &exception, key: "code")
+            put(fields["signal"], into: &exception, key: "signal")
             context["exception"] = .object(exception)
         } else if !threads.isEmpty {
             context["threads"] = .array(threads)
@@ -194,19 +199,12 @@ enum LogisterMetricKitAdapter {
         if kind == .crash || kind == .memoryTermination {
             var termination: LogisterContext = ["namespace": .string("MetricKit")]
             if dataPolicy == .full {
-                put(raw["terminationReason"] ?? raw["exceptionReason"], into: &termination, key: "reason")
+                put(fields["terminationReason"] ?? fields["exceptionReason"], into: &termination, key: "reason")
             }
-            put(raw["exceptionCode"] ?? raw["signal"], into: &termination, key: "code")
+            put(fields["exceptionCode"] ?? fields["signal"], into: &termination, key: "code")
             context["termination"] = .object(termination)
         }
-        if let sourceEvidence = sourceEvidence(
-            diagnostic: raw,
-            metadata: metadata,
-            reportingSource: reportingSource,
-            dataPolicy: dataPolicy
-        ) {
-            context["source_evidence"] = .object(sourceEvidence)
-        }
+        context["source_evidence"] = .object(sourceEvidence(metadata: metadata, reportingSource: reportingSource))
         mergeSourceMetadata(metadata, diagnostic: raw, into: &context)
         if dataPolicy == .full, let rawValue = LogisterValue(jsonObject: raw) {
             context["metrickit"] = rawValue
@@ -214,22 +212,22 @@ enum LogisterMetricKitAdapter {
         return LogisterPrivacySanitizer.sanitize(context)
     }
 
+    /// The raw diagnostic is not copied here: every field the server reads is
+    /// already normalized above, and in safe mode the raw copy would carry
+    /// `diagnosticMetaData` reason text. The `.full` policy keeps it under
+    /// `context.metrickit`.
     private static func sourceEvidence(
-        diagnostic: [String: Any],
         metadata: [String: Any],
-        reportingSource: [String: Any],
-        dataPolicy: LogisterExceptionDataPolicy
-    ) -> LogisterContext? {
-        var diagnostic = diagnostic
-        if dataPolicy != .full {
-            diagnostic.removeValue(forKey: "terminationReason")
-            diagnostic.removeValue(forKey: "exceptionReason")
+        reportingSource: [String: Any]
+    ) -> LogisterContext {
+        var metadata = metadata
+        ["terminationReason", "exceptionReason", "virtualMemoryRegionInfo"].forEach {
+            metadata.removeValue(forKey: $0)
         }
         var evidence: LogisterContext = [
             "format": .string("metrickit_json"),
             "decoder": .string("metrickit-legacy-v2")
         ]
-        if let value = LogisterValue(jsonObject: diagnostic) { evidence["diagnostic"] = value }
         if let value = LogisterValue(jsonObject: metadata) { evidence["metadata"] = value }
         if let start = stringValue(LogisterValue(jsonObject: reportingSource["timeStampBegin"] as Any)),
            let end = stringValue(LogisterValue(jsonObject: reportingSource["timeStampEnd"] as Any)) {
@@ -244,7 +242,11 @@ enum LogisterMetricKitAdapter {
         into context: inout LogisterContext
     ) {
         var app: LogisterContext = [:]
-        put(diagnostic["applicationVersion"] ?? metadata["applicationVersion"], into: &app, key: "version_name")
+        put(
+            diagnostic["applicationVersion"] ?? metadata["applicationVersion"] ?? metadata["appVersion"],
+            into: &app,
+            key: "version_name"
+        )
         put(metadata["applicationBuildVersion"] ?? metadata["appBuildVersion"], into: &app, key: "version_code")
         if !app.isEmpty { context["app"] = .object(app) }
 
@@ -262,21 +264,26 @@ enum LogisterMetricKitAdapter {
         }
     }
 
+    /// The triggered thread comes first so payload budgets never drop it
+    /// before an unrelated thread; `id` keeps the original thread index.
     private static func normalizedThreads(_ raw: [String: Any], kind: LogisterMetricKitDiagnosticKind) -> [LogisterValue] {
         let tree = (raw["callStackTree"] as? [String: Any]) ?? raw
         let stacks = tree["callStacks"] as? [[String: Any]] ?? []
-        return stacks.prefix(maximumThreads).enumerated().map { index, stack in
+        let threads = stacks.prefix(maximumThreads).enumerated().map { index, stack -> (triggered: Bool, value: LogisterValue) in
             let roots = stack["callStackRootFrames"] as? [[String: Any]] ?? []
             let attributed = stack["threadAttributed"] as? Bool ?? false
-            return .object([
+            var thread: LogisterContext = [
                 "id": .string(String(index)),
                 "name": .string(threadName(kind, index: index)),
                 "role": .string(threadRole(kind, index: index, attributed: attributed)),
                 "attributed": .bool(attributed),
                 "triggered": .bool(kind == .crash && attributed),
                 "frames": .array(flatten(roots))
-            ])
+            ]
+            put(stack["sampleCount"], into: &thread, key: "sample_count")
+            return (kind == .crash && attributed, .object(thread))
         }
+        return threads.filter(\.triggered).map(\.value) + threads.filter { !$0.triggered }.map(\.value)
     }
 
     private static func normalizedCallStackTree(
@@ -286,6 +293,11 @@ enum LogisterMetricKitAdapter {
         let tree = (raw["callStackTree"] as? [String: Any]) ?? raw
         let stacks = tree["callStacks"] as? [[String: Any]] ?? []
         guard !stacks.isEmpty else { return nil }
+        // A crash tree is one linear chain per thread, which is exactly the
+        // flattened thread frames; sending both doubled the payload.
+        if kind == .crash, !stacks.contains(where: { isBranched($0["callStackRootFrames"] as? [[String: Any]] ?? []) }) {
+            return nil
+        }
 
         let normalized = stacks.prefix(maximumThreads).enumerated().map { index, stack -> LogisterValue in
             let attributed = stack["threadAttributed"] as? Bool ?? false
@@ -306,6 +318,14 @@ enum LogisterMetricKitAdapter {
             "per_thread": .bool(tree["callStackPerThread"] as? Bool ?? false),
             "stacks": .array(normalized)
         ])
+    }
+
+    private static func isBranched(_ frames: [[String: Any]], depth: Int = 0) -> Bool {
+        guard frames.count <= 1 else { return true }
+        guard depth < maximumCallTreeDepth, let children = frames.first?["subFrames"] as? [[String: Any]] else {
+            return false
+        }
+        return isBranched(children, depth: depth + 1)
     }
 
     private static func normalizedTreeFrame(_ frame: [String: Any], depth: Int) -> LogisterValue {

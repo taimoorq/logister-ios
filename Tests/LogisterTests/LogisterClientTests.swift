@@ -273,8 +273,15 @@ final class LogisterClientTests: XCTestCase {
         XCTAssertEqual((context["distribution"] as? [String: Any])?["channel"] as? String, "testflight")
         XCTAssertEqual(app["in_foreground"] as? Bool, true)
         XCTAssertEqual(app["screen"] as? String, "Checkout")
-        XCTAssertEqual((context["breadcrumbs"] as? [[String: Any]])?.count, LogisterBreadcrumb.maximumPerEvent)
-        XCTAssertEqual((context["breadcrumbs"] as? [[String: Any]])?.first?["message"] as? String, "step-5")
+        // 100 breadcrumbs exceed the server's 512-key event limit, so the
+        // newest that fit are kept and the context is marked truncated.
+        let sent = try XCTUnwrap(context["breadcrumbs"] as? [[String: Any]])
+        XCTAssertLessThan(sent.count, LogisterBreadcrumb.maximumPerEvent)
+        XCTAssertGreaterThan(sent.count, 40)
+        XCTAssertEqual(sent.last?["message"] as? String, "step-104")
+        XCTAssertEqual(sent.first?["message"] as? String, "step-\(105 - sent.count)")
+        XCTAssertEqual(context["_truncated"] as? Bool, true)
+        XCTAssertNotNil(context["sdk"] as? [String: Any])
     }
 
     func testMetricKitDiagnosticNormalizesThreadsProvenanceAndStableUUIDSignature() async throws {
@@ -342,13 +349,9 @@ final class LogisterClientTests: XCTestCase {
         XCTAssertEqual(frames.first?["image_uuid"] as? String, "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")
         XCTAssertEqual(frames.first?["address"] as? String, "0x100000000")
         XCTAssertEqual(frames.first?["relative_address"] as? String, "0x1240")
-        let callTree = try XCTUnwrap(diagnostic["call_stack_tree"] as? [String: Any])
-        let stacks = try XCTUnwrap(callTree["stacks"] as? [[String: Any]])
-        let roots = try XCTUnwrap(stacks.first?["root_frames"] as? [[String: Any]])
-        XCTAssertEqual(callTree["per_thread"] as? Bool, true)
-        XCTAssertEqual(stacks.first?["role"] as? String, "crashed")
-        XCTAssertEqual(roots.first?["relative_address"] as? String, "0x1240")
-        XCTAssertEqual((roots.first?["subframes"] as? [[String: Any]])?.first?["relative_address"] as? String, "0x28")
+        // The linear crash chain is sent once, as the flattened thread frames.
+        XCTAssertNil(diagnostic["call_stack_tree"])
+        XCTAssertEqual(frames.map { $0["relative_address"] as? String }, ["0x1240", "0x28"])
         XCTAssertNil(context["symbolication"])
         XCTAssertEqual((diagnostic["binary_uuids"] as? [String])?.first, "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")
         XCTAssertNil((context["termination"] as? [String: Any])?["reason"])
@@ -837,7 +840,7 @@ final class LogisterClientTests: XCTestCase {
 
         let event = try XCTUnwrap(transport.envelope()["event"] as? [String: Any])
         XCTAssertEqual(event["uuid"] as? String, eventID.uuidString.lowercased())
-        XCTAssertNil(event["authorization"])
+        XCTAssertEqual(event["authorization"] as? String, "[REDACTED]")
         XCTAssertEqual(event["callback"] as? String, "https://example.test/path")
         XCTAssertEqual((event["evidence"] as? [String: Any])?["source"] as? String, "sdk")
     }

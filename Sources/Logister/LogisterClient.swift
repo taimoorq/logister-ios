@@ -485,13 +485,17 @@ public struct LogisterClient: Sendable {
         } catch CaptureDiscard.beforeSend {
             await runtime.recordDiscard(reason: "beforeSend discarded event")
             return .dropped("beforeSend discarded event")
+        } catch {
+            await runtime.recordDiscard(reason: "invalid payload")
+            return .dropped("invalid payload")
         }
         let envelope = ["event": payloadContext.mapValues(\.jsonObject)]
-        guard JSONSerialization.isValidJSONObject(envelope) else {
-            throw LogisterError.invalidPayload
+        guard JSONSerialization.isValidJSONObject(envelope),
+              let body = try? JSONSerialization.data(withJSONObject: envelope, options: []) else {
+            await runtime.recordDiscard(reason: "invalid payload")
+            return .dropped("invalid payload")
         }
 
-        let body = try JSONSerialization.data(withJSONObject: envelope, options: [])
         return await runtime.enqueueAndDrain(
             id: eventID,
             capturedAt: capturedAt,
@@ -739,12 +743,7 @@ public struct LogisterClient: Sendable {
         payload["evidence"] = .object(evidence)
         payload["context"] = .object(context)
 
-        guard var processed = LogisterPrivacySanitizer.sanitizePayload(
-            payload,
-            policy: configuration.payloadPolicy
-        ) else {
-            throw LogisterError.invalidPayload
-        }
+        var processed = LogisterPrivacySanitizer.sanitizePayload(payload, policy: configuration.payloadPolicy)
         if let beforeSend = configuration.beforeSend {
             guard let candidate = beforeSend(processed) else { throw CaptureDiscard.beforeSend }
             processed = candidate
@@ -752,23 +751,35 @@ public struct LogisterClient: Sendable {
         processed["uuid"] = payload["uuid"]
         processed["occurred_at"] = payload["occurred_at"]
         processed["evidence"] = payload["evidence"]
-        guard case .string(let eventType) = processed["event_type"], !eventType.isEmpty,
-              case .string(let message) = processed["message"], !message.isEmpty,
-              let final = LogisterPrivacySanitizer.sanitizePayload(
-                processed,
-                policy: configuration.payloadPolicy
-              ) else {
+        for key in ["event_type", "message"] where !Self.isNonEmptyString(processed[key]) {
+            processed[key] = payload[key]
+        }
+        guard Self.isNonEmptyString(processed["event_type"]), Self.isNonEmptyString(processed["message"]) else {
             throw LogisterError.invalidPayload
         }
-        let byteCount = try JSONSerialization.data(
-            withJSONObject: final.mapValues(\.jsonObject),
-            options: []
-        ).count
-        guard byteCount <= configuration.payloadPolicy.maximumEnvelopeBytes else {
-            throw LogisterError.invalidPayload
-        }
+        return try fittedPayload(processed)
+    }
 
-        return final
+    /// Shrinks the context until the event fits the byte budget. Required
+    /// envelope fields survive every step.
+    private func fittedPayload(_ processed: LogisterContext) throws -> LogisterContext {
+        let policy = configuration.payloadPolicy
+        // The queued body wraps the event as {"event": ...}.
+        let limit = policy.maximumEnvelopeBytes - 16
+        var scale = 1
+        while scale <= 64 {
+            let candidate = LogisterPrivacySanitizer.sanitizePayload(processed, policy: policy, scale: scale)
+            if let size = LogisterPrivacySanitizer.serializedSize(candidate.mapValues(\.jsonObject)), size <= limit {
+                return candidate
+            }
+            scale *= 2
+        }
+        throw LogisterError.invalidPayload
+    }
+
+    private static func isNonEmptyString(_ value: LogisterValue?) -> Bool {
+        guard case .string(let string) = value else { return false }
+        return !string.isEmpty
     }
 
     private func evidence(for event: LogisterEvent, context: LogisterContext) -> LogisterContext {

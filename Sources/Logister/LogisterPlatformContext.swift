@@ -161,45 +161,161 @@ enum LogisterPlatformContext {
 }
 
 enum LogisterPrivacySanitizer {
+    static let redacted = "[REDACTED]"
+    static let truncationKey = "_truncated"
+    // Mirrors the Logister server's TelemetryPayloadLimits.
+    static let maximumArrayLength = 1_000
+    static let maximumMessageLength = 16_384
+
     private static let disallowedKeys: Set<String> = [
         "advertisingid", "advertisingidentifier", "idfa", "idfv",
         "identifierforvendor", "serial", "serialnumber", "deviceserial",
         "hardwareid", "hardwareserial", "androidid", "imei", "meid",
         "subscriberid"
     ]
+    /// Top-level fields owned by the SDK envelope. They are kept whatever the
+    /// budget and are never treated as sensitive keys.
+    static let envelopeKeys: Set<String> = [
+        "uuid", "event_type", "message", "level", "fingerprint", "environment", "release",
+        "occurred_at", "trace_id", "request_id", "session_id", "user_id", "transaction_name",
+        "duration_ms", "evidence", "context"
+    ]
+    /// Identifier values the SDK generates; they are bounded but not scrubbed.
+    private static let identifierKeys: Set<String> = [
+        "uuid", "event_type", "occurred_at", "trace_id", "span_id", "parent_span_id",
+        "request_id", "session_id"
+    ]
+
+    /// SDK-owned context that identifies the event; kept before caller context.
+    private static let priorityContextKeys: Set<String> = [
+        "telemetry_schema_version", "platform", "apple_platform", "sdk", "app", "os", "device",
+        "error", "diagnostic", "exception", "termination", "symbolication", "environment",
+        "release", "trace_id", "request_id", "span_id", "session", "installation"
+    ]
+
+    private struct Budget {
+        var items: Int
+        var keys: Int
+        var maximumStringLength: Int
+        var truncated = false
+    }
 
     static func sanitize(_ context: LogisterContext) -> LogisterContext {
         context.reduce(into: LogisterContext()) { result, entry in
-            let normalized = entry.key.lowercased().filter { $0.isLetter || $0.isNumber }
-            guard !disallowedKeys.contains(normalized) else { return }
+            guard !isDisallowed(entry.key) else { return }
             result[entry.key] = sanitize(entry.value)
         }
     }
 
+    /// Applies redaction and the payload budgets. `scale` divides the budgets
+    /// so a caller can shrink an event that still exceeds the byte limit.
     static func sanitizePayload(
-        _ context: LogisterContext,
-        policy: LogisterPayloadPolicy
-    ) -> LogisterContext? {
-        var remaining = policy.maximumItems
-        return sanitizeObject(context, policy: policy, remaining: &remaining, depth: 0)
+        _ payload: LogisterContext,
+        policy: LogisterPayloadPolicy,
+        scale: Int = 1
+    ) -> LogisterContext {
+        let scale = max(scale, 1)
+        var budget = Budget(
+            items: policy.maximumItems / scale,
+            keys: policy.effectiveMaximumKeys / scale,
+            maximumStringLength: max(policy.maximumStringLength / scale, 128),
+            truncated: scale > 1
+        )
+        var result: LogisterContext = [:]
+        for key in payload.keys.sorted() where envelopeKeys.contains(key) && key != "context" {
+            guard let value = payload[key] else { continue }
+            // Envelope fields are never shortened by the budget, but their keys
+            // still count toward the event total the server enforces.
+            var fieldBudget = Budget(
+                items: policy.maximumItems,
+                keys: policy.effectiveMaximumKeys,
+                maximumStringLength: budget.maximumStringLength
+            )
+            result[key] = sanitizeEnvelopeField(key, value, policy: policy, budget: &fieldBudget)
+            budget.keys -= 1 + policy.effectiveMaximumKeys - fieldBudget.keys
+        }
+
+        // Reserve the context key and its truncation marker.
+        budget.keys -= 2
+        budget.items = policy.maximumItems / scale
+        let attributes = payload.filter { !envelopeKeys.contains($0.key) }
+        for (key, value) in sanitizeObject(attributes, policy: policy, budget: &budget, depth: 0, parentKey: nil) {
+            result[key] = value
+        }
+
+        budget.items = policy.maximumItems / scale
+        var context: LogisterValue?
+        if let value = payload["context"] {
+            context = sanitizeValue(value, policy: policy, budget: &budget, depth: 1, parentKey: "context")
+            if context == nil { budget.truncated = true }
+        }
+        if budget.truncated {
+            var object: LogisterContext = [:]
+            if case .object(let existing) = context { object = existing }
+            object[truncationKey] = .bool(true)
+            context = .object(object)
+        }
+        result["context"] = context
+        return result
     }
 
-    private static func sanitizeObject(
-        _ context: LogisterContext,
+    private static func sanitizeEnvelopeField(
+        _ key: String,
+        _ value: LogisterValue,
         policy: LogisterPayloadPolicy,
-        remaining: inout Int,
-        depth: Int
+        budget: inout Budget
+    ) -> LogisterValue {
+        guard case .string(let string) = value else {
+            return sanitizeValue(value, policy: policy, budget: &budget, depth: 1, parentKey: key) ?? .null
+        }
+        if identifierKeys.contains(key) { return .string(bounded(string, maximumLength: 256)) }
+        let limit = key == "message"
+            ? min(budget.maximumStringLength, maximumMessageLength)
+            : budget.maximumStringLength
+        return .string(scrub(string, maximumLength: limit))
+    }
+
+    /// Scalars are kept before containers and small containers before large
+    /// ones, so a large stack or breadcrumb list cannot crowd out the platform,
+    /// SDK and error facts that identify the event.
+    private static func sanitizeObject(
+        _ object: LogisterContext,
+        policy: LogisterPayloadPolicy,
+        budget: inout Budget,
+        depth: Int,
+        parentKey: String?
     ) -> LogisterContext {
-        guard depth < policy.maximumDepth else { return ["_truncated": .bool(true)] }
         var result: LogisterContext = [:]
-        for key in context.keys.sorted() {
-            guard remaining > 0 else { break }
-            remaining -= 1
-            let deviceKey = key.lowercased().filter { $0.isLetter || $0.isNumber }
-            let sensitiveKey = LogisterPayloadPolicy.normalizedKey(key)
-            guard !disallowedKeys.contains(deviceKey), !policy.sensitiveKeys.contains(sensitiveKey),
-                  let value = context[key] else { continue }
-            result[key] = sanitizeValue(value, policy: policy, remaining: &remaining, depth: depth + 1)
+        let entries = object.filter { !isDisallowed($0.key) }
+        let weightLimit = max(budget.items, budget.keys) + 1
+        let order: [String]
+        if parentKey == "context", depth == 1 {
+            let priority = entries.filter { priorityContextKeys.contains($0.key) }
+            let rest = entries.filter { !priorityContextKeys.contains($0.key) }
+            order = budgetOrder(priority, weightLimit: weightLimit) + budgetOrder(rest, weightLimit: weightLimit)
+        } else {
+            order = budgetOrder(entries, weightLimit: weightLimit)
+        }
+        for key in order {
+            guard budget.items > 0, budget.keys > 0 else {
+                budget.truncated = true
+                break
+            }
+            guard let value = entries[key] else { continue }
+            budget.items -= 1
+            budget.keys -= 1
+            if isSensitive(key, parentKey: parentKey, policy: policy) {
+                result[key] = .string(redacted)
+                continue
+            }
+            guard let sanitized = sanitizeValue(value, policy: policy, budget: &budget, depth: depth + 1, parentKey: key) else {
+                // A leaf object that no longer fits is dropped whole rather than split.
+                budget.items += 1
+                budget.keys += 1
+                budget.truncated = true
+                break
+            }
+            result[key] = sanitized
         }
         return result
     }
@@ -207,46 +323,163 @@ enum LogisterPrivacySanitizer {
     private static func sanitizeValue(
         _ value: LogisterValue,
         policy: LogisterPayloadPolicy,
-        remaining: inout Int,
-        depth: Int
-    ) -> LogisterValue {
+        budget: inout Budget,
+        depth: Int,
+        parentKey: String?
+    ) -> LogisterValue? {
         switch value {
         case .object(let object):
-            return .object(sanitizeObject(object, policy: policy, remaining: &remaining, depth: depth))
-        case .array(let values):
-            guard depth < policy.maximumDepth else { return .array([.string("[TRUNCATED]")]) }
-            var result: [LogisterValue] = []
-            for value in values {
-                guard remaining > 0 else { break }
-                remaining -= 1
-                result.append(sanitizeValue(value, policy: policy, remaining: &remaining, depth: depth + 1))
+            guard depth < policy.maximumDepth else {
+                budget.truncated = true
+                guard budget.keys > 0 else { return .object([:]) }
+                budget.keys -= 1
+                return .object([truncationKey: .bool(true)])
             }
-            return .array(result)
+            if object.values.allSatisfy({ !isContainer($0) }) {
+                let count = object.keys.filter { !isDisallowed($0) }.count
+                guard count <= budget.items, count <= budget.keys else { return nil }
+            }
+            return .object(sanitizeObject(object, policy: policy, budget: &budget, depth: depth, parentKey: parentKey))
+        case .array(let values):
+            guard depth < policy.maximumDepth else {
+                budget.truncated = true
+                return .array([.string("[TRUNCATED]")])
+            }
+            // Breadcrumbs are oldest first; when they do not all fit keep the newest.
+            let newestFirst = parentKey == "breadcrumbs"
+            var result: [LogisterValue] = []
+            for value in newestFirst ? Array(values.suffix(maximumArrayLength).reversed()) : Array(values.prefix(maximumArrayLength)) {
+                guard budget.items > 0 else {
+                    budget.truncated = true
+                    break
+                }
+                budget.items -= 1
+                guard let sanitized = sanitizeValue(value, policy: policy, budget: &budget, depth: depth + 1, parentKey: parentKey) else {
+                    budget.items += 1
+                    budget.truncated = true
+                    break
+                }
+                result.append(sanitized)
+            }
+            if values.count > maximumArrayLength { budget.truncated = true }
+            return .array(newestFirst ? result.reversed() : result)
         case .string(let string):
-            return .string(scrub(string, maximumLength: policy.maximumStringLength))
+            return .string(scrub(string, maximumLength: budget.maximumStringLength))
+        case .number(let number):
+            // JSONSerialization raises an Objective-C exception for NaN and infinity.
+            return number.isFinite ? value : .null
         default:
             return value
         }
     }
 
-    private static func scrub(_ value: String, maximumLength: Int) -> String {
-        var result = value.replacingOccurrences(
-            of: #"(?i)bearer\s+[^\s]+"#,
-            with: "Bearer [REDACTED]",
-            options: .regularExpression
-        )
-        if let expression = try? NSRegularExpression(pattern: #"https?://[^\s]+"#, options: [.caseInsensitive]) {
-            let range = NSRange(result.startIndex..., in: result)
-            for match in expression.matches(in: result, range: range).reversed() {
-                guard let swiftRange = Range(match.range, in: result),
-                      var components = URLComponents(string: String(result[swiftRange])) else { continue }
-                components.query = nil
-                components.fragment = nil
-                if let replacement = components.string { result.replaceSubrange(swiftRange, with: replacement) }
+    private static func budgetOrder(_ entries: LogisterContext, weightLimit: Int) -> [String] {
+        let scalars = entries.filter { !isContainer($0.value) }.map(\.key).sorted()
+        let weighted: [(key: String, weight: Int)] = entries.compactMap { entry in
+            isContainer(entry.value) ? (entry.key, weight(entry.value, limit: weightLimit)) : nil
+        }
+        let containers = weighted.sorted { lhs, rhs in
+            lhs.weight == rhs.weight ? lhs.key < rhs.key : lhs.weight < rhs.weight
+        }.map(\.key)
+        return scalars + containers
+    }
+
+    private static func isSensitive(_ key: String, parentKey: String?, policy: LogisterPayloadPolicy) -> Bool {
+        // The MetricKit adapter's own grouping signature is not a credential.
+        if key == "signature", parentKey == "diagnostic" { return false }
+        return policy.isSensitiveKey(key)
+    }
+
+    private static func isDisallowed(_ key: String) -> Bool {
+        disallowedKeys.contains(LogisterPayloadPolicy.normalizedKey(key))
+    }
+
+    private static func isContainer(_ value: LogisterValue) -> Bool {
+        switch value {
+        case .object, .array: true
+        default: false
+        }
+    }
+
+    private static func weight(_ value: LogisterValue, limit: Int) -> Int {
+        var total = 0
+        var pending = [value]
+        while let next = pending.popLast(), total <= limit {
+            switch next {
+            case .object(let object):
+                total += object.count
+                pending.append(contentsOf: object.values)
+            case .array(let values):
+                total += values.count
+                pending.append(contentsOf: values)
+            default:
+                break
             }
         }
-        guard result.count > maximumLength else { return result }
-        return String(result.prefix(maximumLength)) + "…"
+        return total
+    }
+
+    private static let bearerExpression = try? NSRegularExpression(pattern: #"\b(bearer)\s+[^\s"',;]+"#, options: [.caseInsensitive])
+    private static let basicExpression = try? NSRegularExpression(pattern: #"\b(basic)\s+([A-Za-z0-9+/]{4,}={0,2})"#, options: [.caseInsensitive])
+    private static let urlExpression = try? NSRegularExpression(pattern: #"https?://[^\s"'<>]+"#, options: [.caseInsensitive])
+    private static let jwtExpression = try? NSRegularExpression(pattern: #"\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"#)
+    private static let logisterKeyExpression = try? NSRegularExpression(pattern: #"\blgst_[A-Za-z0-9_-]+"#)
+
+    static func scrub(_ value: String, maximumLength: Int) -> String {
+        var result = value
+        replaceMatches(of: bearerExpression, in: &result) { match, string in
+            "\(substring(string, match.range(at: 1))) \(redacted)"
+        }
+        replaceMatches(of: basicExpression, in: &result) { match, string in
+            // Only a base64 `user:password` pair is a Basic credential; this keeps
+            // ordinary prose such as "basic setup" readable.
+            let encoded = substring(string, match.range(at: 2))
+            guard let decoded = Data(base64Encoded: encoded).flatMap({ String(data: $0, encoding: .utf8) }),
+                  decoded.contains(":") else { return nil }
+            return "\(substring(string, match.range(at: 1))) \(redacted)"
+        }
+        replaceMatches(of: urlExpression, in: &result) { match, string in
+            guard var components = URLComponents(string: substring(string, match.range)) else { return nil }
+            components.user = nil
+            components.password = nil
+            components.query = nil
+            components.fragment = nil
+            return components.string
+        }
+        replaceMatches(of: jwtExpression, in: &result) { _, _ in redacted }
+        replaceMatches(of: logisterKeyExpression, in: &result) { _, _ in redacted }
+        return bounded(result, maximumLength: maximumLength)
+    }
+
+    private static func replaceMatches(
+        of expression: NSRegularExpression?,
+        in string: inout String,
+        replacement: (NSTextCheckingResult, String) -> String?
+    ) {
+        guard let expression else { return }
+        let matches = expression.matches(in: string, range: NSRange(string.startIndex..., in: string))
+        for match in matches.reversed() {
+            guard let range = Range(match.range, in: string),
+                  let replacement = replacement(match, string) else { continue }
+            string.replaceSubrange(range, with: replacement)
+        }
+    }
+
+    private static func substring(_ string: String, _ range: NSRange) -> String {
+        Range(range, in: string).map { String(string[$0]) } ?? ""
+    }
+
+    private static func bounded(_ value: String, maximumLength: Int) -> String {
+        guard value.count > maximumLength else { return value }
+        return String(value.prefix(maximumLength)) + "…"
+    }
+
+    /// Returns the JSON size, or nil when the value cannot be serialized.
+    /// `JSONSerialization` raises instead of throwing for invalid input, so
+    /// validity is always checked first.
+    static func serializedSize(_ object: Any) -> Int? {
+        guard JSONSerialization.isValidJSONObject(object) else { return nil }
+        return try? JSONSerialization.data(withJSONObject: object).count
     }
 
     private static func sanitize(_ value: LogisterValue) -> LogisterValue {
